@@ -1,0 +1,27 @@
+{
+  "name": "pi-interactive-subagents",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Interactive subagents for pi — spawn, orchestrate, and manage sub-agent sessions in cmux terminals",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": [
+      "./pi-extension/subagents/index.ts",
+      "./pi-extension/session-artifacts/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/test.ts"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HazAT/pi-subagents"
+  },
+  "author": "HazAT",
+  "license": "MIT"
+}
