@@ -1,7 +1,24 @@
 import { execSync } from "node:child_process";
+import { basename } from "node:path";
 
 export function isCmuxAvailable(): boolean {
   return !!process.env.CMUX_SOCKET_PATH;
+}
+
+/**
+ * Detect if the user's default shell is fish.
+ * Fish uses $status instead of $? for exit codes.
+ */
+export function isFishShell(): boolean {
+  const shell = process.env.SHELL ?? "";
+  return basename(shell) === "fish";
+}
+
+/**
+ * Return the shell-appropriate exit status variable ($? for bash/zsh, $status for fish).
+ */
+export function exitStatusVar(): string {
+  return isFishShell() ? "$status" : "$?";
 }
 
 export function shellEscape(s: string): string {

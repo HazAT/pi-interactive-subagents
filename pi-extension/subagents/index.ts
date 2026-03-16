@@ -11,6 +11,7 @@ import {
   pollForExit,
   closeSurface,
   shellEscape,
+  exitStatusVar,
   renameCurrentTab,
   renameWorkspace,
 } from "./cmux.ts";
@@ -234,7 +235,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         parts.push(`@${taskFile}`);
 
         const piCommand = parts.join(" ");
-        const command = `${piCommand}; rm -f ${shellEscape(taskFile)}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${piCommand}; rm -f ${shellEscape(taskFile)}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
 
         // Send to surface
         sendCommand(surface, command);
@@ -650,10 +651,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
           writeFileSync(msgFile, params.message, "utf8");
           parts.push(`@${msgFile}`);
-          const command = `${parts.join(" ")}; rm -f ${shellEscape(msgFile)}; echo '__SUBAGENT_DONE_'$?'__'`;
+          const command = `${parts.join(" ")}; rm -f ${shellEscape(msgFile)}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
           sendCommand(surface, command);
         } else {
-          const command = `${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+          const command = `${parts.join(" ")}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
           sendCommand(surface, command);
         }
 
