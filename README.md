@@ -2,6 +2,10 @@
 
 Interactive subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in [cmux](https://github.com/manaflow-ai/cmux) terminals.
 
+
+https://github.com/user-attachments/assets/c2dafe55-e4a6-4bcc-afac-273e3f05bdca
+
+
 This package gives pi the ability to delegate work to specialized sub-agents that run in their own terminal sessions. A main orchestrator session spawns scouts, planners, workers, and reviewers — each visible in a side-by-side cmux split. The user can watch progress in real-time, interact with interactive agents, and get summaries when autonomous agents finish.
 
 ## Install
