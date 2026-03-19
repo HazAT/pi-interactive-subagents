@@ -246,8 +246,11 @@ async function runSubagent(
       "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
     const identity = agentDefs?.body ?? params.systemPrompt ?? null;
     const roleBlock = identity ? `\n\n${identity}` : "";
+    const forkPreamble =
+      "[Session forked for focused work. Continue naturally from the conversation above. " +
+      "Do NOT restart or re-execute anything already done.]\n\n";
     const fullTask = params.fork
-      ? params.task
+      ? `${forkPreamble}${params.task}`
       : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
 
     // Build pi command
