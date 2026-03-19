@@ -236,6 +236,9 @@ async function runSubagent(
     }
 
     // Build the task message
+    // When forking, the sub-agent already has the full conversation context.
+    // Only send the user's task as a clean message — no wrapper instructions
+    // that would confuse the agent into thinking it needs to restart.
     const modeHint = interactive
       ? "The user will interact with you here. When done, they will exit with Ctrl+D."
       : "Complete your task autonomously. When finished, call the subagent_done tool to close this session.";
@@ -243,7 +246,9 @@ async function runSubagent(
       "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
     const identity = agentDefs?.body ?? params.systemPrompt ?? null;
     const roleBlock = identity ? `\n\n${identity}` : "";
-    const fullTask = `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    const fullTask = params.fork
+      ? params.task
+      : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
 
     // Build pi command
     const parts: string[] = ["pi"];
