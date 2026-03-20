@@ -15,26 +15,7 @@ A planning workflow that offloads brainstorming and plan creation to a dedicated
 
 ---
 
-## Tab Titles
 
-Use `set_tab_title` to keep the user informed of progress in the multiplexer UI. Update the title at every phase transition.
-
-| Phase | Title example |
-|-------|--------------|
-| Investigation | `🔍 Investigating: <short task>` |
-| Planning | `💬 Planning: <short task>` |
-| Review plan | `📋 Review: <short task>` |
-| Executing | `🔨 Executing: 1/3 — <short task>` (update counter per worker) |
-| Reviewing | `🔎 Reviewing: <short task>` |
-| Done | `✅ Done: <short task>` |
-
-Name subagents with context too:
-- Scout: `"🔍 Scout"` (default is fine)
-- Workers: `"🔨 Worker 1/3"`, `"🔨 Worker 2/3"`, etc.
-- Reviewer: `"🔎 Reviewer"`
-- Planner: `"💬 Planner"`
-
----
 
 ## The Flow
 

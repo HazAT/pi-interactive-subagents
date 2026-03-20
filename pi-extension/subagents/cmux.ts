@@ -210,6 +210,10 @@ export function createSurfaceSplit(
     }
     if (fromSurface) {
       args.push("-t", fromSurface);
+    } else if (process.env.TMUX_PANE) {
+      // Always target the pane where pi is running, not whatever
+      // the user happens to have focused in another tmux window.
+      args.push("-t", process.env.TMUX_PANE);
     }
     args.push("-P", "-F", "#{pane_id}");
 

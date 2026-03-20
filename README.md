@@ -35,14 +35,13 @@ Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij` to force a specific backend.
 
 ### Extensions
 
-**Subagents** - 5 tools + 3 commands for spawning and managing sub-agents:
+**Subagents** - 4 tools + 3 commands for spawning and managing sub-agents:
 
 | Tool | Description |
 |------|-------------|
 | `subagent` | Spawn a sub-agent in a dedicated multiplexer pane |
 | `parallel_subagents` | Run multiple autonomous sub-agents concurrently with tiled layout |
 | `subagents_list` | List available agent definitions |
-| `set_tab_title` | Update tab/window title to show progress |
 | `subagent_resume` | Resume a previous sub-agent session |
 
 | Command | Description |
