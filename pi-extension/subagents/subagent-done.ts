@@ -82,22 +82,42 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Auto-exit: when the agent loop ends, shut down automatically.
-  // If the user sends any input (stops the agent, types a message), auto-exit
-  // is permanently disabled for this session — the user has taken over.
+  // If the user interrupts (Escape) or sends any input, auto-exit is disabled
+  // for that cycle — the user wants to steer. Once they're done and the agent
+  // completes normally again, auto-exit re-engages.
   // Enabled via `auto-exit: true` in agent frontmatter.
   if (autoExit) {
     let userTookOver = false;
 
-    pi.on("input", (event) => {
-      if ((event as any).source === "user") {
-        userTookOver = true;
-      }
+    pi.on("input", () => {
+      userTookOver = true;
     });
 
-    pi.on("agent_end", (_event, ctx) => {
-      if (!userTookOver) {
-        ctx.shutdown();
+    pi.on("agent_end", (event, ctx) => {
+      if (userTookOver) {
+        // User sent input — they're steering. Reset so auto-exit can
+        // re-engage once the next agent run completes normally.
+        userTookOver = false;
+        return;
       }
+
+      // Check if the agent was interrupted (Escape). The last assistant
+      // message will have stopReason "aborted" when the user cancels.
+      const messages = (event as any).messages as any[] | undefined;
+      if (messages) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg?.role === "assistant") {
+            if (msg.stopReason === "aborted") {
+              // User pressed Escape — don't exit, let them steer.
+              return;
+            }
+            break;
+          }
+        }
+      }
+
+      ctx.shutdown();
     });
   }
 
