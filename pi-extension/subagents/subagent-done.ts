@@ -7,6 +7,28 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
+export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
+  return agentStarted;
+}
+
+export function shouldAutoExitOnAgentEnd(
+  userTookOver: boolean,
+  messages: any[] | undefined,
+): boolean {
+  if (userTookOver) return false;
+
+  if (messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg?.role === "assistant") {
+        return msg.stopReason !== "aborted";
+      }
+    }
+  }
+
+  return true;
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -88,33 +110,28 @@ export default function (pi: ExtensionAPI) {
   // Enabled via `auto-exit: true` in agent frontmatter.
   if (autoExit) {
     let userTookOver = false;
+    let agentStarted = false;
+
+    pi.on("agent_start", () => {
+      agentStarted = true;
+    });
 
     pi.on("input", () => {
+      // Ignore the initial task message that starts an autonomous subagent.
+      // Only inputs after the first agent run has started count as user takeover.
+      if (!shouldMarkUserTookOver(agentStarted)) return;
       userTookOver = true;
     });
 
     pi.on("agent_end", (event, ctx) => {
-      if (userTookOver) {
-        // User sent input — they're steering. Reset so auto-exit can
-        // re-engage once the next agent run completes normally.
+      const messages = (event as any).messages as any[] | undefined;
+      const shouldExit = shouldAutoExitOnAgentEnd(userTookOver, messages);
+      if (!shouldExit) {
+        // User sent input after the agent had started, or the run was interrupted
+        // with Escape. Reset takeover so auto-exit can re-engage on the next
+        // normal completion cycle.
         userTookOver = false;
         return;
-      }
-
-      // Check if the agent was interrupted (Escape). The last assistant
-      // message will have stopReason "aborted" when the user cancels.
-      const messages = (event as any).messages as any[] | undefined;
-      if (messages) {
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msg = messages[i];
-          if (msg?.role === "assistant") {
-            if (msg.stopReason === "aborted") {
-              // User pressed Escape — don't exit, let them steer.
-              return;
-            }
-            break;
-          }
-        }
       }
 
       ctx.shutdown();
