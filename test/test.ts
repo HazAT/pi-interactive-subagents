@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { visibleWidth } from "@mariozechner/pi-tui";
+import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
   getLeafId,
@@ -243,6 +245,96 @@ describe("session.ts", () => {
       const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
       assert.equal(targetLines.length, 3);
     });
+  });
+});
+
+describe("subagents widget rendering", () => {
+  it("keeps every rendered line within a very narrow width", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+
+    const originalNow = Date.now;
+    Date.now = () => 1_000_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([
+        {
+          id: "a1",
+          name: "A",
+          task: "",
+          surface: "s1",
+          startTime: 1_000_000 - 13_000,
+          sessionFile: "sess1",
+          entries: 13,
+          bytes: 55.6 * 1024,
+        },
+        {
+          id: "a2",
+          name: "B",
+          task: "",
+          surface: "s2",
+          startTime: 1_000_000 - 21_000,
+          sessionFile: "sess2",
+          entries: 21,
+          bytes: 115.6 * 1024,
+        },
+        {
+          id: "a3",
+          name: "C",
+          task: "",
+          surface: "s3",
+          startTime: 1_000_000 - 27_000,
+          sessionFile: "sess3",
+          entries: 27,
+          bytes: 106.8 * 1024,
+        },
+      ], 16);
+
+      assert.deepEqual(
+        lines.map((line: string) => visibleWidth(line)),
+        [16, 16, 16, 16, 16],
+      );
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("truncates the right-hand status instead of overflowing when it alone is too wide", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.borderLine, "function");
+
+    const line = testApi.borderLine(" A ", " 999 msgs (999.9KB) ", 16);
+    assert.equal(visibleWidth(line), 16);
+  });
+
+  it("handles ultra-narrow widths without exceeding the width contract", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+
+    const widths = [0, 1, 2];
+    for (const width of widths) {
+      const lines = testApi.renderSubagentWidgetLines([
+        {
+          id: "a1",
+          name: "A",
+          task: "",
+          surface: "s1",
+          startTime: Date.now() - 5_000,
+          sessionFile: "sess1",
+          entries: 1,
+          bytes: 1,
+        },
+      ], width);
+
+      for (const line of lines) {
+        assert.ok(
+          visibleWidth(line) <= width,
+          `expected line width <= ${width}, got ${visibleWidth(line)} for ${JSON.stringify(line)}`,
+        );
+      }
+    }
   });
 });
 

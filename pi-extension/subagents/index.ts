@@ -249,9 +249,21 @@ const RST = "\x1b[0m";
  * Left content is truncated if needed, right is preserved, padded to fill width.
  */
 function borderLine(left: string, right: string, width: number): string {
+  if (width <= 0) return "";
+  if (width === 1) return `${ACCENT}│${RST}`;
+
   // width = total visible chars for the whole line including │ and │
   const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
   const rightVis = visibleWidth(right);
+
+  // If the status chunk alone is too wide, prefer preserving it in compact form
+  // rather than overflowing the terminal.
+  if (rightVis >= contentWidth) {
+    const truncRight = truncateToWidth(right, contentWidth);
+    const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
+    return `${ACCENT}│${RST}${truncRight}${" ".repeat(rightPad)}${ACCENT}│${RST}`;
+  }
+
   const maxLeft = Math.max(0, contentWidth - rightVis);
   const truncLeft = truncateToWidth(left, maxLeft);
   const leftVis = visibleWidth(truncLeft);
@@ -264,6 +276,9 @@ function borderLine(left: string, right: string, width: number): string {
  * All chars are accounted for within `width`.
  */
 function borderTop(title: string, info: string, width: number): string {
+  if (width <= 0) return "";
+  if (width === 1) return `${ACCENT}╭${RST}`;
+
   // ╭─ Title ───...─── info ─╮
   // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
   const inner = Math.max(0, width - 2); // inside ╭ and ╮
@@ -279,8 +294,34 @@ function borderTop(title: string, info: string, width: number): string {
  * Build the bordered bottom line: ╰──────────────────╯
  */
 function borderBottom(width: number): string {
+  if (width <= 0) return "";
+  if (width === 1) return `${ACCENT}╰${RST}`;
+
   const inner = Math.max(0, width - 2);
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
+}
+
+function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+  const count = agents.length;
+  const title = "Subagents";
+  const info = `${count} running`;
+
+  const lines: string[] = [borderTop(title, info, width)];
+
+  for (const agent of agents) {
+    const elapsed = formatElapsedMMSS(agent.startTime);
+    const agentTag = agent.agent ? ` (${agent.agent})` : "";
+    const left = ` ${elapsed}  ${agent.name}${agentTag} `;
+    const right =
+      agent.entries != null && agent.bytes != null
+        ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
+        : " starting… ";
+
+    lines.push(borderLine(left, right, width));
+  }
+
+  lines.push(borderBottom(width));
+  return lines;
 }
 
 function updateWidget() {
@@ -301,32 +342,18 @@ function updateWidget() {
       return {
         invalidate() {},
         render(width: number) {
-          const count = runningSubagents.size;
-          const title = "Subagents";
-          const info = `${count} running`;
-
-          const lines: string[] = [borderTop(title, info, width)];
-
-          for (const [_id, agent] of runningSubagents) {
-            const elapsed = formatElapsedMMSS(agent.startTime);
-            const agentTag = agent.agent ? ` (${agent.agent})` : "";
-            const left = ` ${elapsed}  ${agent.name}${agentTag} `;
-            const right =
-              agent.entries != null && agent.bytes != null
-                ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
-                : " starting… ";
-
-            lines.push(borderLine(left, right, width));
-          }
-
-          lines.push(borderBottom(width));
-          return lines;
+          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
         },
       };
     },
     { placement: "aboveEditor" },
   );
 }
+
+export const __test__ = {
+  borderLine,
+  renderSubagentWidgetLines,
+};
 
 function startWidgetRefresh() {
   if (widgetInterval) return;
