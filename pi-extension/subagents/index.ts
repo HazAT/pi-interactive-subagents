@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   readdirSync,
   statSync,
@@ -103,10 +103,16 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   return denied;
 }
 
+/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
+function getAgentConfigDir(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
+  const configDir = getAgentConfigDir();
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(homedir(), ".pi", "agent", "agents", `${agentName}.md`),
+    join(configDir, "agents", `${agentName}.md`),
     join(dirname(new URL(import.meta.url).pathname), "../../agents", `${agentName}.md`),
   ];
   for (const p of paths) {
@@ -171,11 +177,10 @@ function muxUnavailableResult(kind: "subagents" | "tab-title" = "subagents") {
 /**
  * Build the artifact directory path for the current session.
  * Same convention as the write_artifact tool:
- *   ~/.pi/history/<project>/artifacts/<session-id>/
+ *   <sessionDir>/artifacts/<session-id>/
  */
-function getArtifactDir(cwd: string, sessionId: string): string {
-  const project = basename(cwd);
-  return join(homedir(), ".pi", "history", project, "artifacts", sessionId);
+function getArtifactDir(sessionDir: string, sessionId: string): string {
+  return join(sessionDir, "artifacts", sessionId);
 }
 
 function formatBytes(bytes: number): string {
@@ -502,8 +507,14 @@ async function launchSubagent(
     }
   }
 
-  // Build env prefix: denied tools + subagent identity
+  // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
+
+  // Propagate PI_CODING_AGENT_DIR so subagents use the same config root
+  if (process.env.PI_CODING_AGENT_DIR) {
+    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+  }
+
   if (denySet.size > 0) {
     envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
   }
@@ -525,7 +536,7 @@ async function launchSubagent(
     parts.push(shellEscape(fullTask));
   } else {
     const sessionId = ctx.sessionManager.getSessionId();
-    const artifactDir = getArtifactDir(ctx.cwd, sessionId);
+    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const safeName = params.name
       .toLowerCase()
@@ -540,12 +551,17 @@ async function launchSubagent(
     parts.push(`@${artifactPath}`);
   }
 
-  // Resolve cwd — param overrides agent default, supports absolute and relative paths
+  // Resolve cwd — param overrides agent default, supports absolute and relative paths.
+  // For agent-default cwd (from the .md definition), resolve relative to the config dir
+  // where the agent was discovered — not process.cwd(). This allows agents to find their
+  // role folders when PI_CODING_AGENT_DIR points to a different directory than cwd.
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
+  const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
+  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
   const effectiveCwd = rawCwd
     ? rawCwd.startsWith("/")
       ? rawCwd
-      : join(process.cwd(), rawCwd)
+      : join(cwdBase, rawCwd)
     : null;
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
@@ -884,7 +900,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             path: join(dirname(new URL(import.meta.url).pathname), "../../agents"),
             source: "package",
           },
-          { path: join(homedir(), ".pi", "agent", "agents"), source: "global" },
+          { path: join(getAgentConfigDir(), "agents"), source: "global" },
           { path: join(process.cwd(), ".pi", "agents"), source: "project" },
         ];
 

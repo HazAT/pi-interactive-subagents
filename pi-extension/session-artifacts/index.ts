@@ -3,8 +3,7 @@ import { highlightCode, getLanguageFromPath, keyHint } from "@mariozechner/pi-co
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 const PREVIEW_LINES = 10;
 
@@ -14,11 +13,11 @@ export default function (pi: ExtensionAPI) {
     label: "Write Artifact",
     description:
       "Write a session-scoped artifact file (plan, context, research, notes, etc.). " +
-      "Files are stored under ~/.pi/history/<project>/artifacts/<session-id>/. " +
+      "Files are stored under <sessionDir>/artifacts/<session-id>/. " +
       "Use this instead of writing pi working files directly.",
     promptSnippet:
       "Write a session-scoped artifact file (plan, context, research, notes, etc.). " +
-      "Files are stored under ~/.pi/history/<project>/artifacts/<session-id>/. " +
+      "Files are stored under <sessionDir>/artifacts/<session-id>/. " +
       "Use this instead of writing pi working files directly.",
     promptGuidelines: [
       "Use write_artifact for any pi working file: plans, scout context, research notes, reviews, or other session artifacts.",
@@ -68,9 +67,9 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const project = basename(ctx.cwd);
+      const sessionDir = ctx.sessionManager.getSessionDir();
       const sessionId = ctx.sessionManager.getSessionId();
-      const artifactDir = join(homedir(), ".pi", "history", project, "artifacts", sessionId);
+      const artifactDir = join(sessionDir, "artifacts", sessionId);
       const filePath = resolve(artifactDir, params.name);
 
       // Safety: ensure we're not escaping the artifact directory
@@ -191,9 +190,9 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const project = basename(ctx.cwd);
+      const sessionDir = ctx.sessionManager.getSessionDir();
       const sessionId = ctx.sessionManager.getSessionId();
-      const projectArtifactsDir = join(homedir(), ".pi", "history", project, "artifacts");
+      const projectArtifactsDir = join(sessionDir, "artifacts");
 
       const found = findArtifact(projectArtifactsDir, sessionId, params.name);
 
