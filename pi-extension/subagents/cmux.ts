@@ -161,10 +161,30 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 }
 
 /**
- * Create a new terminal pane as a right split and set its title.
+ * Create a new terminal surface for a subagent.
+ *
+ * Controlled by `PI_SUBAGENT_SURFACE_MODE`:
+ *   - `tab`   — new tab in the same pane (cmux only, falls back to split elsewhere)
+ *   - `split` — right split (default, works on all backends)
+ *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
  */
 export function createSurface(name: string): string {
+  const mode = (process.env.PI_SUBAGENT_SURFACE_MODE ?? "split").trim().toLowerCase();
+  if (mode === "tab" && getMuxBackend() === "cmux") {
+    const out = execSync(`cmux new-surface`, {
+      encoding: "utf8",
+    }).trim();
+    const match = out.match(/surface:\d+/);
+    if (!match) {
+      throw new Error(`Unexpected cmux new-surface output: ${out}`);
+    }
+    const surface = match[0];
+    execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
+      encoding: "utf8",
+    });
+    return surface;
+  }
   return createSurfaceSplit(name, "right");
 }
 
