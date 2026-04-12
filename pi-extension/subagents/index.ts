@@ -10,6 +10,7 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -654,6 +655,31 @@ async function watchSubagent(
             const raw = readFileSync(sessionFile, "utf8");
             running.entries = raw.split("\n").filter((l) => l.trim()).length;
             running.bytes = stat.size;
+          }
+        } catch {}
+
+        // Check for caller_ping from child
+        try {
+          const pingFile = `${sessionFile}.ping`;
+          if (existsSync(pingFile)) {
+            const raw = readFileSync(pingFile, "utf8");
+            unlinkSync(pingFile); // Delete before steering to avoid re-detection
+            const data = JSON.parse(raw);
+
+            pi.sendMessage(
+              {
+                customType: "subagent_ping",
+                content: `Sub-agent "${data.name}" needs help:\n\n${data.message}\n\nYou can inspect the child's terminal with cmux readScreen, or send input via cmux sendCommand to surface "${running.surface}".`,
+                display: true,
+                details: {
+                  name: data.name,
+                  message: data.message,
+                  surface: running.surface,
+                  agent: running.agent,
+                },
+              },
+              { triggerTurn: true, deliverAs: "steer" },
+            );
           }
         } catch {}
       },
