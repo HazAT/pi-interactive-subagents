@@ -1337,6 +1337,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     };
   });
 
+  // ── subagent_ping message renderer ──
+  pi.registerMessageRenderer("subagent_ping", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const name = details.name ?? "subagent";
+        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+        const bgFn = (text: string) => theme.bg("toolSuccessBg", text);
+
+        const icon = theme.fg("accent", "?");
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— needs help")}`;
+
+        const contentLines = [header];
+
+        if (options.expanded) {
+          contentLines.push("");
+          contentLines.push(details.message ?? "");
+          if (details.surface) {
+            contentLines.push("");
+            contentLines.push(theme.fg("dim", `Surface: ${details.surface}`));
+          }
+        } else {
+          const preview = (details.message ?? "").split("\n")[0].slice(0, width - 10);
+          contentLines.push(theme.fg("dim", preview));
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
+
+        const box = new Box(1, 1, bgFn);
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
+  });
+
   // /plan command — start the full planning workflow
   pi.registerCommand("plan", {
     description: "Start a planning session: /plan <what to build>",
