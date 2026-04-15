@@ -639,7 +639,13 @@ export function closeSurface(surface: string): void {
     return;
   }
 
-  zellijActionSync(["close-pane"], surface);
+  // close-pane supports --pane-id (zellij 0.44+), same as dump-screen.
+  // Call execFileSync directly so we don't also set ZELLIJ_PANE_ID in the
+  // child env — close-pane doesn't need it and the targeting is explicit.
+  const paneId = zellijPaneId(surface);
+  execFileSync("zellij", ["action", "close-pane", "--pane-id", paneId], {
+    encoding: "utf8",
+  });
 }
 
 export interface PollResult {
