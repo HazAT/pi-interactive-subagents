@@ -159,14 +159,22 @@ function waitForFile(path: string, timeoutMs = 5000): string {
 }
 
 function zellijActionSync(args: string[], surface?: string): string {
-  return execFileSync("zellij", ["action", ...args], {
+  const fullArgs = ["action", ...args];
+  if (surface) {
+    fullArgs.push("--pane-id", zellijPaneId(surface));
+  }
+  return execFileSync("zellij", fullArgs, {
     encoding: "utf8",
     env: zellijEnv(surface),
   });
 }
 
 async function zellijActionAsync(args: string[], surface?: string): Promise<string> {
-  const { stdout } = await execFileAsync("zellij", ["action", ...args], {
+  const fullArgs = ["action", ...args];
+  if (surface) {
+    fullArgs.push("--pane-id", zellijPaneId(surface));
+  }
+  const { stdout } = await execFileAsync("zellij", fullArgs, {
     encoding: "utf8",
     env: zellijEnv(surface),
   });
@@ -317,37 +325,28 @@ export function createSurfaceSplit(
   }
 
   // zellij
+  // `new-pane` returns the pane ID in stdout (e.g. "terminal_7").
+  // Use it directly instead of the old temp-file approach, which was
+  // racy: write-chars without --pane-id targets the focused pane,
+  // so switching Zellij tabs between new-pane and write-chars sent
+  // the ID-capture command to the wrong pane.
   const directionArg = direction === "left" || direction === "right" ? "right" : "down";
-  const tokenPath = join(
-    tmpdir(),
-    `pi-subagent-zellij-pane-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
-  );
   const args = ["new-pane", "--direction", directionArg, "--name", name, "--cwd", process.cwd()];
 
+  let rawId: string;
   try {
-    zellijActionSync(args, fromSurface);
+    rawId = zellijActionSync(args, fromSurface).trim();
   } catch {
     if (!fromSurface) throw new Error("Failed to create zellij pane");
-    zellijActionSync(args);
+    rawId = zellijActionSync(args).trim();
   }
 
-  // IMPORTANT: do not pass a long-running command to `new-pane`.
-  // zellij keeps the `action new-pane -- <cmd>` process attached until <cmd>
-  // exits. If <cmd> is an interactive shell, the parent call hangs forever.
-  // Instead, create a normal shell pane first, then ask the focused pane
-  // to print its own $ZELLIJ_PANE_ID into a temp file.
-  const captureIdCmd = `echo "$ZELLIJ_PANE_ID" > ${shellEscape(tokenPath)}`;
-  zellijActionSync(["write-chars", captureIdCmd]);
-  zellijActionSync(["write", "13"]);
-
-  const paneId = waitForFile(tokenPath);
-  try {
-    rmSync(tokenPath, { force: true });
-  } catch {}
-
-  if (!paneId || !/^\d+$/.test(paneId)) {
-    throw new Error(`Unexpected zellij pane id: ${paneId || "(empty)"}`);
+  // new-pane returns e.g. "terminal_7" — extract the numeric part
+  const idMatch = rawId.match(/(\d+)/);
+  if (!idMatch) {
+    throw new Error(`Unexpected zellij pane id from new-pane: ${rawId || "(empty)"}`);
   }
+  const paneId = idMatch[1];
 
   const surface = `pane:${paneId}`;
 
