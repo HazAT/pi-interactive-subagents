@@ -404,7 +404,16 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
-  zellijActionSync(["rename-tab", title]);
+  // zellij: rename the agent's own pane, not the whole tab. In multi-pane
+  // layouts the tab title applies to unrelated sibling panes, which is noisy.
+  // ZELLIJ_PANE_ID is set in every pane's environment, so target our own
+  // pane explicitly rather than whatever pane happens to be focused.
+  const paneId = process.env.ZELLIJ_PANE_ID;
+  if (paneId) {
+    zellijActionSync(["rename-pane", title], `pane:${paneId}`);
+  } else {
+    zellijActionSync(["rename-pane", title]);
+  }
 }
 
 /**
