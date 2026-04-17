@@ -50,6 +50,12 @@ zellij --session pi   # then run: pi
 
 Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
 
+If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
+
+```bash
+export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
+```
+
 ## What's Included
 
 ### Extensions

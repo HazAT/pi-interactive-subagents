@@ -603,6 +603,38 @@ describe("subagent-done.ts", () => {
     });
   });
 });
+describe("subagent startup delay", () => {
+  it("defaults to 500ms when no env var is set", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
+
+    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    try {
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
+    } finally {
+      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+    }
+  });
+
+  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
+
+    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+    try {
+      assert.equal(testApi.getShellReadyDelayMs(), 2500);
+    } finally {
+      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+    }
+  });
+});
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;

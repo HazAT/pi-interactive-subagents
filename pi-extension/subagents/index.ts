@@ -290,6 +290,19 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
+/**
+ * Wait long enough for a freshly created pane to finish shell startup.
+ *
+ * Some environments do extra shell-init work before the prompt is ready
+ * (for example direnv/devenv), so the delay is configurable for users who hit
+ * dropped commands. Keep the historical default at 500ms.
+ */
+function getShellReadyDelayMs(): number {
+  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -495,6 +508,7 @@ function updateWidget() {
 
 export const __test__ = {
   borderLine,
+  getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -556,7 +570,7 @@ async function launchSubagent(
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
   if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
   // ── Claude Code CLI path ──
@@ -1287,7 +1301,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
