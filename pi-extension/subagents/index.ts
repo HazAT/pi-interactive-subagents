@@ -1400,10 +1400,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
+        // Also set PI_SUBAGENT_AUTO_EXIT and PI_SUBAGENT_SESSION so the resumed agent
+        // can self-terminate (auto-exit listener + subagent_done/.exit sidecar).
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
+        // Enable auto-exit so the resumed session shuts down after the agent finishes
+        resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+        // Set session file path so subagent_done / caller_ping can write the .exit sidecar
+        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
+        // Propagate name for widget display
+        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         const resumeEnvPrefix = resumeEnvParts.length > 0 ? resumeEnvParts.join(" ") + " " : "";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
