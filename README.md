@@ -35,6 +35,7 @@ Supported multiplexers:
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
+- [kitty](https://sw.kovidgoyal.net/kitty/) (terminal emulator with built-in remote control)
 
 Start pi inside one of them:
 
@@ -46,9 +47,11 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm — no wrapper needed
+# or
+# just run pi inside kitty — no wrapper needed (requires allow_remote_control yes in kitty.conf)
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|kitty` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -385,6 +388,9 @@ Every sub-agent session displays a compact tools widget showing available and de
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
+  - [kitty](https://sw.kovidgoyal.net/kitty/) — requires `allow_remote_control yes` in `kitty.conf`
+
+> **Kitty tip:** For the most reliable experience (especially crash detection), also add `listen_on unix:/tmp/kitty-$UID.sock` to `kitty.conf`. This lets pi communicate with kitty via a socket instead of the terminal, avoiding any terminal interference.
 
 ```bash
 cmux pi
@@ -393,13 +399,13 @@ tmux new -A -s pi 'pi'
 # or
 zellij --session pi   # then run: pi
 # or
-# just run pi inside WezTerm
+# just run pi inside WezTerm or kitty — no wrapper needed
 ```
 
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm, kitty
 ```
 
 ## License

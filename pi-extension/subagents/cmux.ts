@@ -6,7 +6,7 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "kitty";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -29,7 +29,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm" || pref === "kitty") return pref;
   return null;
 }
 
@@ -49,6 +49,10 @@ function isWezTermRuntimeAvailable(): boolean {
   return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
 }
 
+function isKittyRuntimeAvailable(): boolean {
+  return !!process.env.KITTY_WINDOW_ID && hasCommand("kitten");
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -65,17 +69,23 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+export function isKittyAvailable(): boolean {
+  return isKittyRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "kitty") return isKittyRuntimeAvailable() ? "kitty" : null;
 
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isKittyRuntimeAvailable()) return "kitty";
   return null;
 }
 
@@ -97,7 +107,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "kitty") {
+    return "Start pi inside kitty with remote control enabled (`allow_remote_control yes` in kitty.conf).";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or kitty (with `allow_remote_control yes` in kitty.conf).";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -331,6 +344,30 @@ export function createSurfaceSplit(
     return paneId;
   }
 
+  if (backend === "kitty") {
+    // Creates a new tab in the current OS window, returns the kitty window ID.
+    // Direction and fromSurface are not applicable for tab creation.
+    const args = ["@", "launch", "--type=tab", "--tab-title", name, "--keep-focus", "--cwd", process.cwd()];
+    let windowId: string;
+    try {
+      windowId = execFileSync("kitten", args, { encoding: "utf8" }).trim();
+    } catch (err: any) {
+      const msg = String(err?.stderr || err?.message || err);
+      if (msg.includes("Remote control is disabled") || msg.includes("remote control")) {
+        throw new Error(
+          "Kitty remote control is disabled. " +
+          "Ensure `allow_remote_control yes` is in ~/.config/kitty/kitty.conf, " +
+          "then fully restart kitty (config reload is not sufficient for this setting)."
+        );
+      }
+      throw err;
+    }
+    if (!windowId || !/^\d+$/.test(windowId)) {
+      throw new Error(`Unexpected kitten launch output: ${windowId || "(empty)"}`);
+    }
+    return windowId;
+  }
+
   // zellij
   const directionArg = direction === "left" || direction === "right" ? "right" : "down";
   const args = ["new-pane", "--direction", directionArg, "--name", name, "--cwd", process.cwd()];
@@ -408,6 +445,12 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "kitty") {
+    // Rename the current tab (the one running this pi instance).
+    execFileSync("kitten", ["@", "set-tab-title", title], { encoding: "utf8" });
+    return;
+  }
+
   // zellij: rename the agent's own pane, not the whole tab. In multi-pane layouts,
   // rename-tab clobbers the user's tab title whenever a subagent starts or /plan runs.
   // Closes #21.
@@ -463,6 +506,11 @@ export function renameWorkspace(title: string): void {
     return;
   }
 
+  if (backend === "kitty") {
+    // Kitty has no session/workspace concept; tab rename is sufficient.
+    return;
+  }
+
   // Skip session rename for zellij. rename-session renames the socket file
   // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
   // name, so all subsequent `zellij action ...` CLI calls fail with
@@ -493,6 +541,15 @@ export function sendCommand(surface: string, command: string): void {
 
   if (backend === "wezterm") {
     execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", command + "\n"], {
+      encoding: "utf8",
+    });
+    return;
+  }
+
+  if (backend === "kitty") {
+    // surface is the kitty window ID (numeric string).
+    // send-text sends literal text; include a real newline to execute the command.
+    execFileSync("kitten", ["@", "send-text", "--match", `id:${surface}`, "--", command + "\n"], {
       encoding: "utf8",
     });
     return;
@@ -571,6 +628,15 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
+  if (backend === "kitty") {
+    const raw = execFileSync(
+      "kitten",
+      ["@", "get-text", "--match", `id:${surface}`],
+      { encoding: "utf8" },
+    );
+    return tailLines(raw, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
   // and --path may silently fail to create the file. Stdout capture is robust.
@@ -616,6 +682,15 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return tailLines(stdout, lines);
   }
 
+  if (backend === "kitty") {
+    const { stdout } = await execFileAsync(
+      "kitten",
+      ["@", "get-text", "--match", `id:${surface}`],
+      { encoding: "utf8" },
+    );
+    return tailLines(stdout, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
   const { stdout } = await execFileAsync(
@@ -648,6 +723,18 @@ export function closeSurface(surface: string): void {
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "kitty") {
+    // Close the window (and its containing tab if it was the only window).
+    try {
+      execFileSync("kitten", ["@", "close-window", "--match", `id:${surface}`, "--no-response"], {
+        encoding: "utf8",
+      });
+    } catch {
+      // Optional — the tab may have already been closed by the shell exiting.
+    }
     return;
   }
 
