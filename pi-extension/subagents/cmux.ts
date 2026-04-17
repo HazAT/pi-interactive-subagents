@@ -629,9 +629,17 @@ export function readScreen(surface: string, lines = 50): string {
   }
 
   if (backend === "kitty") {
+    // kitten @ communicates via APC escape sequences through the terminal pty.
+    // When called from the parent pi process this races with pi's own stdin
+    // reader, causing the response bytes to corrupt pi's input buffer.
+    // Prefer the KITTY_LISTEN_ON socket (set when listen_on is configured in
+    // kitty.conf) which avoids the terminal entirely.  If the socket is not
+    // available, return empty so the caller falls back to file-based detection.
+    const listenOn = process.env.KITTY_LISTEN_ON;
+    if (!listenOn) return "";
     const raw = execFileSync(
       "kitten",
-      ["@", "get-text", "--match", `id:${surface}`],
+      ["@", "--to", listenOn, "get-text", "--match", `id:${surface}`],
       { encoding: "utf8" },
     );
     return tailLines(raw, lines);
@@ -683,9 +691,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   }
 
   if (backend === "kitty") {
+    const listenOn = process.env.KITTY_LISTEN_ON;
+    if (!listenOn) return "";
     const { stdout } = await execFileAsync(
       "kitten",
-      ["@", "get-text", "--match", `id:${surface}`],
+      ["@", "--to", listenOn, "get-text", "--match", `id:${surface}`],
       { encoding: "utf8" },
     );
     return tailLines(stdout, lines);
@@ -791,7 +801,11 @@ export async function pollForExit(
     if (options.sentinelFile) {
       try {
         if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
+          let exitCode = 0;
+          try {
+            exitCode = parseInt(readFileSync(options.sentinelFile, "utf8").trim(), 10) || 0;
+          } catch {}
+          return { reason: "sentinel", exitCode };
         }
       } catch {}
     }
