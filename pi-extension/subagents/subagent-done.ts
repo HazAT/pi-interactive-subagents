@@ -135,6 +135,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Write .exit sidecar so the parent detects exit via the fast file-check
+      // path in pollForExit, without needing to poll the terminal screen.
+      // This avoids the kitty APC-over-pty race that corrupts the parent's input.
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (sessionFile) {
+        try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" })); } catch {}
+      }
+
       ctx.shutdown();
     });
   }

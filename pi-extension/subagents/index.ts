@@ -832,13 +832,18 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+  // Write the exit code to a sentinel file so pollForExit can detect crashes
+  // via a plain file-existence check (no screen polling required). This is
+  // especially important for the kitty backend where kitten @ get-text
+  // communicates via APC sequences that can corrupt the parent's input.
+  const sentinelFile = join(artifactDir, "subagent-scripts", `${launchScriptName}.done`);
+  const command = `${piCommand}; _PI_EXIT=$?; echo $_PI_EXIT > ${shellEscape(sentinelFile)} 2>/dev/null; echo '__SUBAGENT_DONE_'$_PI_EXIT'__'`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
@@ -859,6 +864,7 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
+    sentinelFile,
   };
 
   runningSubagents.set(id, running);
@@ -1394,10 +1400,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
+        // Also set PI_SUBAGENT_AUTO_EXIT and PI_SUBAGENT_SESSION so the resumed agent
+        // can self-terminate (auto-exit listener + subagent_done/.exit sidecar).
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
+        // Enable auto-exit so the resumed session shuts down after the agent finishes
+        resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+        // Set session file path so subagent_done / caller_ping can write the .exit sidecar
+        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
+        // Propagate name for widget display
+        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         const resumeEnvPrefix = resumeEnvParts.length > 0 ? resumeEnvParts.join(" ") + " " : "";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
