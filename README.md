@@ -31,6 +31,7 @@ pi install git:github.com/HazAT/pi-interactive-subagents
 
 Supported multiplexers:
 
+- [herdr](https://github.com/ogulcancelik/herdr) (terminal workspace manager for AI coding agents)
 - [cmux](https://github.com/manaflow-ai/cmux)
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
@@ -39,6 +40,8 @@ Supported multiplexers:
 Start pi inside one of them:
 
 ```bash
+herdr            # then run: pi
+# or
 cmux pi
 # or
 tmux new -A -s pi 'pi'
@@ -48,7 +51,9 @@ zellij --session pi   # then run: pi
 # just run pi inside WezTerm — no wrapper needed
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+When multiple multiplexers are available, **herdr takes precedence** (detected via `HERDR_ENV=1`), then cmux, tmux, zellij, WezTerm.
+
+Optional: set `PI_SUBAGENT_MUX=herdr|cmux|tmux|zellij|wezterm` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
