@@ -84,14 +84,6 @@ export function getLeafId(sessionFile: string): string | null {
 }
 
 /**
- * Return the number of non-empty lines (entries) in the session file.
- */
-export function getEntryCount(sessionFile: string): number {
-  const raw = readFileSync(sessionFile, "utf8");
-  return raw.split("\n").filter((line) => line.trim()).length;
-}
-
-/**
  * Return entries added after `afterLine` (1-indexed count of existing entries).
  */
 export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {

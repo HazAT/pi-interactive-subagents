@@ -1,6 +1,5 @@
 {
   "status": {
-    "enabled": true,
-    "defaultCadenceSeconds": 60
+    "enabled": true
   }
 }

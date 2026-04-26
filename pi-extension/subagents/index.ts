@@ -5,7 +5,6 @@ import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
 import {
   readdirSync,
-  statSync,
   readFileSync,
   writeFileSync,
   existsSync,
@@ -30,7 +29,6 @@ import {
 } from "./cmux.ts";
 import {
   findLastAssistantMessage,
-  getEntryCount,
   getNewEntries,
   seedSubagentSessionFile,
 } from "./session.ts";
@@ -39,14 +37,20 @@ import {
   type SubagentStatusState,
   advanceStatusState,
   capStatusLines,
+  classifyStatus,
   createStatusState,
-  forceStatusQuiet,
+  forceStatusAfterInterrupt,
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
-  resolveStatusCadenceMs,
 } from "./status.ts";
+import {
+  getSubagentActivityFile,
+  readSubagentActivityFile,
+  type ActivityReadResult,
+  type SubagentActivityState,
+} from "./activity.ts";
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -116,13 +120,6 @@ const SubagentParams = Type.Object({
     Type.String({
       description:
         "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
-    }),
-  ),
-  statusCadenceSeconds: Type.Optional(
-    Type.Integer({
-      minimum: 1,
-      description:
-        "Optional per-run idle-time window in seconds for active/quiet/stalled classification. Lower values are clamped to a safe minimum.",
     }),
   ),
 });
@@ -413,35 +410,25 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  const kb = bytes / 1024;
-  if (kb < 1024) return `${kb.toFixed(1)}KB`;
-  const mb = kb / 1024;
-  return `${mb.toFixed(1)}MB`;
-}
-
 const statusConfig = loadStatusConfig();
 
-function readSessionProgress(sessionFile: string): { entries: number; bytes: number } | null {
-  if (!existsSync(sessionFile)) return null;
-  const stat = statSync(sessionFile);
-  return {
-    entries: getEntryCount(sessionFile),
-    bytes: stat.size,
-  };
-}
-
-function buildWidgetRightLabel(agent: RunningSubagent, snapshot: StatusSnapshot): string {
+function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
   if (snapshot.kind === "running") return ` running ${snapshot.elapsedText} `;
   if (snapshot.kind === "active") {
-    if (agent.entries != null && agent.bytes != null) {
-      return ` active · ${agent.entries} msgs `;
-    }
-    return " active ";
+    const label = snapshot.activityLabel ?? snapshot.activeScope;
+    const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
+    return label ? ` active · ${label}${duration} ` : " active ";
   }
-  return ` ${snapshot.kind} ${snapshot.idleText} `;
+  if (snapshot.kind === "waiting") {
+    const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
+    const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
+    return ` waiting${duration}${detail} `;
+  }
+
+  const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
+  const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
+  return ` stalled${detail}${duration} `;
 }
 
 function resolveResultPresentation(
@@ -484,8 +471,13 @@ interface RunningSubagent {
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
-  entries?: number;
-  bytes?: number;
+  activityFile?: string;
+  activity?: SubagentActivityState;
+  activityRead?: {
+    ok: boolean;
+    reason?: "missing" | "invalid" | "wrong-id";
+    error?: string;
+  };
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
@@ -591,14 +583,12 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const left = ` ${elapsed}  ${agent.name}${agentTag} `;
-    const snapshot = advanceStatusState(agent.statusState, Date.now()).snapshot;
+    const snapshot = classifyStatus(agent.statusState, Date.now());
     const right = statusConfig.enabled
-      ? buildWidgetRightLabel(agent, snapshot)
-      : agent.entries != null && agent.bytes != null
-        ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
-        : agent.cli === "claude"
-          ? " running… "
-          : " starting… ";
+      ? formatWidgetRightLabel(snapshot)
+      : agent.cli === "claude"
+        ? " running… "
+        : " starting… ";
 
     lines.push(borderLine(left, right, width));
   }
@@ -666,26 +656,47 @@ function buildPiPromptArgs(params: {
   ];
 }
 
-function isIgnorableSessionProgressError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code;
-  return code === "ENOENT" || code === "EBUSY";
+function activityLabel(activity: SubagentActivityState): string | undefined {
+  if (activity.phase !== "active") return undefined;
+  if (activity.activeScope === "tool") return activity.toolName ?? "tool";
+  if (activity.activeScope === "provider") return "provider";
+  if (activity.activeScope === "streaming") return "streaming";
+  return activity.activeScope;
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
   if (running.cli === "claude") return;
 
-  try {
-    const progress = readSessionProgress(running.sessionFile);
-    if (!progress) return;
+  const activityFile = running.activityFile;
+  const read: ActivityReadResult = activityFile
+    ? readSubagentActivityFile(activityFile, running.id)
+    : { ok: false, reason: "missing" };
 
-    running.entries = progress.entries;
-    running.bytes = progress.bytes;
-    running.statusState = observeStatus(running.statusState, progress, observedAt);
-  } catch (error) {
-    // Ignore transient session-file races while the child is starting or appending.
-    // Unexpected errors should still fail fast.
-    if (!isIgnorableSessionProgressError(error)) throw error;
+  running.activityRead = read.ok
+    ? { ok: true }
+    : { ok: false, reason: read.reason, error: read.error };
+
+  if (read.ok) {
+    running.activity = read.activity;
+    running.statusState = observeStatus(running.statusState, {
+      snapshot: "present",
+      updatedAt: read.activity.updatedAt,
+      sequence: read.activity.sequence,
+      phase: read.activity.phase,
+      active: read.activity.phase === "active",
+      activeScope: read.activity.activeScope,
+      activeSince: read.activity.activeSince,
+      waitingSince: read.activity.waitingSince,
+      latestEvent: read.activity.latestEvent,
+      activityLabel: activityLabel(read.activity),
+    }, observedAt);
+    return;
   }
+
+  running.statusState = observeStatus(running.statusState, {
+    snapshot: read.reason,
+    snapshotError: read.error,
+  }, observedAt);
 }
 
 function resolveInterruptTarget(params: { id?: string; name?: string }):
@@ -753,6 +764,9 @@ function handleSubagentInterrupt(
     };
   }
 
+  const now = Date.now();
+  observeRunningSubagent(running, now);
+
   const interruption = requestSubagentInterrupt(running, sendEscapeKey);
   if ("error" in interruption) {
     return {
@@ -761,7 +775,7 @@ function handleSubagentInterrupt(
     };
   }
 
-  running.statusState = forceStatusQuiet(running.statusState, Date.now());
+  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   updateWidget();
 
   return {
@@ -788,6 +802,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
+      observeRunningSubagent(running, now);
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
         shouldRefreshWidget = true;
@@ -832,9 +847,8 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildPiPromptArgs,
-  buildWidgetRightLabel,
-  isIgnorableSessionProgressError,
-  readSessionProgress,
+  formatWidgetRightLabel,
+  observeRunningSubagent,
   resolveDenyTools,
   resolveInterruptTarget,
   requestSubagentInterrupt,
@@ -903,7 +917,6 @@ async function launchSubagent(
   }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-  const statusCadenceMs = resolveStatusCadenceMs(statusConfig, params.statusCadenceSeconds);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -914,7 +927,8 @@ async function launchSubagent(
     });
   }
 
-  const initialProgress = readSessionProgress(subagentSessionFile);
+  const activityFile = getSubagentActivityFile(artifactDir, id);
+  mkdirSync(dirname(activityFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -952,7 +966,7 @@ async function launchSubagent(
       cmdParts.push("--model", shellEscape(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = params.systemPrompt ?? agentDefs.body;
     if (sp) {
       cmdParts.push("--append-system-prompt", shellEscape(sp));
     }
@@ -1000,7 +1014,6 @@ async function launchSubagent(
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
-        cadenceMs: statusCadenceMs,
       }),
     };
 
@@ -1028,7 +1041,7 @@ async function launchSubagent(
   if (identityInSystemPrompt && identity) {
     const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
     const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = (params.name ?? "subagent")
+    const spSafeName = params.name
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "")
       .replace(/\s+/g, "-")
@@ -1073,6 +1086,8 @@ async function launchSubagent(
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
+  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
@@ -1138,15 +1153,11 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
-    entries: initialProgress?.entries,
-    bytes: initialProgress?.bytes,
+    activityFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
-      cadenceMs: statusCadenceMs,
-      baselineEntries: initialProgress?.entries,
-      baselineBytes: initialProgress?.bytes,
     }),
   };
 
@@ -1467,28 +1478,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
             status: "started",
-            statusCadenceSeconds: params.statusCadenceSeconds,
           },
         };
       },
 
       renderCall(args, theme) {
-        const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
-        const cwdHint = args.cwd ? theme.fg("dim", ` in ${args.cwd}`) : "";
-        const cadenceHint = args.statusCadenceSeconds
-          ? theme.fg("dim", ` · idle window ${args.statusCadenceSeconds}s`)
+        const partialArgs = args as Record<string, unknown>;
+        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "(unnamed)";
+        const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
+        const agent = typeof partialArgs.agent === "string" && partialArgs.agent
+          ? theme.fg("dim", ` (${partialArgs.agent})`)
+          : "";
+        const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
+          ? theme.fg("dim", ` in ${partialArgs.cwd}`)
           : "";
         let text =
           "▸ " +
-          theme.fg("toolTitle", theme.bold(args.name ?? "(unnamed)")) +
+          theme.fg("toolTitle", theme.bold(name)) +
           agent +
-          cwdHint +
-          cadenceHint;
+          cwdHint;
 
         // Show a one-line task preview. renderCall is called repeatedly as the
         // LLM generates tool arguments, so args.task grows token by token.
         // We keep it compact here — Ctrl+O on renderResult expands the full content.
-        const task = args.task ?? "";
         if (task) {
           const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
           const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine;
@@ -1521,7 +1533,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -1573,7 +1585,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
-        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -1659,25 +1671,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             description: "Optional message to send after resuming (e.g. follow-up instructions)",
           }),
         ),
-        statusCadenceSeconds: Type.Optional(
-          Type.Integer({
-            minimum: 1,
-            description:
-              "Optional per-run idle-time window in seconds for active/quiet/stalled classification in this resumed run. Lower values are clamped to a safe minimum.",
-          }),
-        ),
       }),
 
       renderCall(args, theme) {
         const name = args.name ?? "Resume";
-        const cadenceHint = args.statusCadenceSeconds
-          ? theme.fg("dim", ` · idle window ${args.statusCadenceSeconds}s`)
-          : "";
         const text =
           "▸ " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", " — resuming session") +
-          cadenceHint;
+          theme.fg("dim", " — resuming session");
         return new Text(text, 0, 0);
       },
 
@@ -1697,13 +1698,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback
-        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const name = params.name ?? "Resume";
         const startTime = Date.now();
+        const id = Math.random().toString(16).slice(2, 10);
 
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
@@ -1723,7 +1725,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-        const statusCadenceMs = resolveStatusCadenceMs(statusConfig, params.statusCadenceSeconds);
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
@@ -1737,6 +1738,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+        const activityFile = getSubagentActivityFile(artifactDir, id);
+        mkdirSync(dirname(activityFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -1761,7 +1764,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
-        const resumeEnvPrefix = resumeEnvParts.length > 0 ? resumeEnvParts.join(" ") + " " : "";
+        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
@@ -1786,8 +1793,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
 
         // Register as a running subagent for widget tracking
-        const id = Math.random().toString(16).slice(2, 10);
-        const initialProgress = readSessionProgress(params.sessionPath);
         const running: RunningSubagent = {
           id,
           name,
@@ -1796,14 +1801,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startTime,
           sessionFile: params.sessionPath,
           launchScriptFile,
-          entries: initialProgress?.entries,
-          bytes: initialProgress?.bytes,
+          activityFile,
+          interactive: true,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
-            cadenceMs: statusCadenceMs,
-            baselineEntries: entryCountBefore,
-            baselineBytes: initialProgress?.bytes,
           }),
         };
         runningSubagents.set(id, running);
@@ -1883,7 +1885,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionPath: params.sessionPath,
             launchScriptFile,
             status: "started",
-            statusCadenceSeconds: params.statusCadenceSeconds,
           },
         };
       },
@@ -1893,7 +1894,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerCommand("iterate", {
     description: "Fork session into a subagent for focused work (bugfixes, iteration)",
     handler: async (args, _ctx) => {
-      const task = args?.trim() || "";
+      const task = args.trim() || "";
       const toolCall = task
         ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
         : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
@@ -1905,7 +1906,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
     handler: async (args, ctx) => {
-      const trimmed = (args ?? "").trim();
+      const trimmed = args.trim();
       if (!trimmed) {
         ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
         return;
@@ -2068,7 +2069,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerCommand("plan", {
     description: "Start a planning session: /plan <what to build>",
     handler: async (args, ctx) => {
-      const task = (args ?? "").trim();
+      const task = args.trim();
       if (!task) {
         ctx.ui.notify("Usage: /plan <what to build>", "warning");
         return;

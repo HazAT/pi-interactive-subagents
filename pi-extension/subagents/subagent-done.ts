@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
+import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -46,6 +47,11 @@ export default function (pi: ExtensionAPI) {
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
+  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const recorder = createSubagentActivityRecorder({
+    runningChildId: process.env.PI_SUBAGENT_ID,
+    activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+  });
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -98,10 +104,12 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  let userTookOver = false;
+  let agentStarted = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -109,40 +117,85 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  // Auto-exit: when the agent loop ends, shut down automatically.
-  // If the user interrupts (Escape) or sends any input, auto-exit is disabled
-  // for that cycle — the user wants to steer. Once they're done and the agent
-  // completes normally again, auto-exit re-engages.
-  // Enabled via `auto-exit: true` in agent frontmatter.
-  if (autoExit) {
-    let userTookOver = false;
-    let agentStarted = false;
+  pi.on("input", () => {
+    recorder.input();
+    // Ignore the initial task message that starts an autonomous subagent.
+    // Only inputs after the first agent run has started count as user takeover.
+    if (!shouldMarkUserTookOver(agentStarted)) return;
+    userTookOver = true;
+  });
 
-    pi.on("agent_start", () => {
-      agentStarted = true;
-    });
+  pi.on("before_agent_start", () => {
+    recorder.beforeAgentStart();
+  });
 
-    pi.on("input", () => {
-      // Ignore the initial task message that starts an autonomous subagent.
-      // Only inputs after the first agent run has started count as user takeover.
-      if (!shouldMarkUserTookOver(agentStarted)) return;
-      userTookOver = true;
-    });
+  pi.on("agent_start", () => {
+    agentStarted = true;
+    recorder.agentStart();
+  });
 
-    pi.on("agent_end", (event, ctx) => {
-      const messages = (event as any).messages as any[] | undefined;
-      const shouldExit = shouldAutoExitOnAgentEnd(userTookOver, messages);
-      if (!shouldExit) {
-        // User sent input after the agent had started, or the run was interrupted
-        // with Escape. Reset takeover so auto-exit can re-engage on the next
-        // normal completion cycle.
-        userTookOver = false;
-        return;
-      }
+  pi.on("agent_end", (event, ctx) => {
+    const messages = (event as any).messages as any[] | undefined;
+    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
+    if (shouldExit) {
+      recorder.agentEndDone();
       ctx.shutdown();
-    });
-  }
+      return;
+    }
+
+    recorder.agentEndWaiting();
+    if (autoExit) {
+      // User sent input after the agent had started, or the run was interrupted
+      // with Escape. Reset takeover so auto-exit can re-engage on the next
+      // normal completion cycle.
+      userTookOver = false;
+    }
+  });
+
+  pi.on("turn_start", (event) => {
+    recorder.turnStart((event as any).turnIndex);
+  });
+
+  pi.on("turn_end", (event) => {
+    recorder.turnEnd((event as any).turnIndex);
+  });
+
+  pi.on("before_provider_request", () => {
+    recorder.beforeProviderRequest();
+  });
+
+  pi.on("after_provider_response", () => {
+    recorder.afterProviderResponse();
+  });
+
+  pi.on("message_update", (event) => {
+    recorder.messageUpdate((event as any).assistantMessageEvent?.type);
+  });
+
+  pi.on("tool_execution_start", (event) => {
+    recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
+  });
+
+  pi.on("tool_call", (event) => {
+    recorder.toolCall((event as any).toolCallId, (event as any).toolName);
+  });
+
+  pi.on("tool_execution_update", (event) => {
+    recorder.toolExecutionUpdate((event as any).toolCallId, (event as any).toolName);
+  });
+
+  pi.on("tool_result", (event) => {
+    recorder.toolResult((event as any).toolCallId, (event as any).toolName);
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
+  });
+
+  pi.on("session_shutdown", (event) => {
+    recorder.sessionShutdown((event as any).reason);
+  });
 
   // Toggle expand/collapse with Ctrl+J
   pi.registerShortcut("ctrl+j", {
@@ -172,6 +225,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
+      recorder.callerPing();
       const exitData = {
         type: "ping" as const,
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
@@ -197,6 +251,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      recorder.subagentDone();
       if (sessionFile) {
         writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
       }

@@ -109,11 +109,13 @@ for (const backend of backends) {
       }
     });
 
-    // ── In-progress stalled status ──
+    // ── In-progress activity snapshots ──
 
-    it("surfaces a compact stalled status before final completion", async () => {
+    it("keeps a long active tool call from surfacing false stalled status", async () => {
       const id = uniqueId();
+      const startFile = `/tmp/pi-integ-status-start-${id}.txt`;
       const markerFile = `/tmp/pi-integ-status-${id}.txt`;
+      trackTempFile(env, startFile);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `status-${id}`);
@@ -123,22 +125,22 @@ for (const backend of backends) {
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Status-${id}"`,
         `  agent: "test-echo"`,
-        `  statusCadenceSeconds: 10`,
-        `  task: "Run this bash command: sleep 55; echo 'STATUS_${id}' > '${markerFile}'"`,
+        `  task: "Run this bash command: echo 'START_${id}' > '${startFile}'; sleep 90; echo 'STATUS_${id}' > '${markerFile}'"`,
         `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      const stalledScreen = await waitForScreen(
-        surface,
-        /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i,
-        PI_TIMEOUT,
-        300,
-      );
-      assert.match(stalledScreen, /Subagent status/i);
-      assert.match(stalledScreen, /stalled/i);
+      const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
+      assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+
+      await waitForFile(startFile, PI_TIMEOUT, /START_/);
+      assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
+      await sleep(65_000);
+      assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
+      const watchdogScreen = readScreen(surface, 300);
+      assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
       assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);

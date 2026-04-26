@@ -2,10 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_STATUS_CADENCE_MS = 60_000;
-export const MIN_STATUS_CADENCE_MS = 10_000;
-export const MIN_STALLED_MS = 30_000;
-export const STALLED_MULTIPLIER = 3;
+export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
@@ -14,35 +11,53 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "quiet" | "stalled" | "running";
+export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
+export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
+export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
 export interface StatusConfig {
   enabled: boolean;
-  defaultCadenceMs: number;
   lineLimit: number;
 }
 
-export interface StatusObservation {
-  entries: number;
-  bytes: number;
-}
+export type StatusObservation =
+  | {
+      snapshot: "present";
+      updatedAt: number;
+      sequence: number;
+      phase: StatusActivityPhase;
+      active?: boolean;
+      activeScope?: string;
+      activeSince?: number;
+      waitingSince?: number;
+      latestEvent?: string;
+      activityLabel?: string;
+    }
+  | {
+      snapshot: "missing" | "invalid" | "wrong-id";
+      snapshotError?: string;
+    };
 
 export interface SubagentStatusState {
   source: SubagentStatusSource;
   startTimeMs: number;
-  cadenceMs: number;
-  baselineEntries: number | null;
-  baselineBytes: number | null;
-  observedEntries: number | null;
-  observedBytes: number | null;
   firstObservationAtMs: number | null;
-  lastProgressAtMs: number | null;
-  // Cadence tracks classification/progress windows for local widget status.
-  // Routine status messages are intentionally not emitted.
-  lastCadenceAtMs: number;
-  lastCadenceEntries: number | null;
+  lastActivityAtMs: number | null;
+  lastActivitySequence: number | null;
+  localOverrideAtMs: number | null;
+  localOverrideSequence: number | null;
+  activeNow: boolean;
+  activeSinceMs: number | null;
+  activeScope: string | null;
+  waitingSinceMs: number | null;
+  phase: StatusActivityPhase | null;
+  latestEvent: string | null;
+  activityLabel: string | null;
+  snapshotState: StatusSnapshotState;
+  snapshotProblemSinceMs: number | null;
+  snapshotError: string | null;
   currentKind: SubagentStatusKind;
 }
 
@@ -50,9 +65,17 @@ export interface StatusSnapshot {
   kind: SubagentStatusKind;
   elapsedMs: number;
   elapsedText: string;
-  idleMs: number | null;
-  idleText: string | null;
-  progressEvents: number | null;
+  activeSinceMs: number | null;
+  activeDurationText: string | null;
+  activeScope: string | null;
+  waitingSinceMs: number | null;
+  waitingDurationText: string | null;
+  latestEvent: string | null;
+  activityLabel: string | null;
+  snapshotState: StatusSnapshotState;
+  snapshotError: string | null;
+  snapshotProblemText: string | null;
+  statusLabel: string | null;
 }
 
 export interface CappedStatusLines {
@@ -78,16 +101,16 @@ function requireBoolean(value: unknown, source: string, fieldName: string): bool
   return value;
 }
 
-function requirePositiveInteger(value: unknown, source: string, fieldName: string): number {
-  if (!Number.isInteger(value) || value <= 0) {
-    invalidStatusConfig(source, `${fieldName} must be a positive integer`);
+function rejectUnsupportedKeys(
+  value: Record<string, unknown>,
+  allowedKeys: string[],
+  source: string,
+  fieldName: string,
+): void {
+  const unsupportedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
+  if (unsupportedKeys.length > 0) {
+    invalidStatusConfig(source, `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`);
   }
-  return value;
-}
-
-function clampCadenceMs(ms: number): number {
-  if (!Number.isFinite(ms) || ms <= 0) return DEFAULT_STATUS_CADENCE_MS;
-  return Math.max(MIN_STATUS_CADENCE_MS, Math.floor(ms));
 }
 
 function truncateText(text: string, maxLength: number): string {
@@ -105,19 +128,23 @@ function boundStatusLine(line: string): string {
   return truncateText(line.replace(/\s+/g, " ").trim(), MAX_STATUS_LINE_LENGTH);
 }
 
+function snapshotProblemLabel(snapshotState: StatusSnapshotState): string | null {
+  if (snapshotState === "wrong-id") return "wrong activity id";
+  return null;
+}
+
+function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeScope">): string | null {
+  return snapshot.activityLabel ?? snapshot.activeScope;
+}
+
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
+  rejectUnsupportedKeys(status, ["enabled"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
-  const defaultCadenceSeconds = requirePositiveInteger(
-    status.defaultCadenceSeconds,
-    source,
-    "status.defaultCadenceSeconds",
-  );
 
   return {
     enabled,
-    defaultCadenceMs: clampCadenceMs(defaultCadenceSeconds * 1000),
     lineLimit: DEFAULT_STATUS_LINE_LIMIT,
   };
 }
@@ -160,18 +187,6 @@ export function loadStatusConfig(
   return parseStatusConfig(parsed, sourcePath);
 }
 
-export function resolveStatusCadenceMs(
-  config: StatusConfig,
-  requestedSeconds?: number,
-): number {
-  if (requestedSeconds == null) return config.defaultCadenceMs;
-  return clampCadenceMs(requestedSeconds * 1000);
-}
-
-export function getStalledAfterMs(cadenceMs: number): number {
-  return Math.max(cadenceMs * STALLED_MULTIPLIER, MIN_STALLED_MS);
-}
-
 export function formatElapsedDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   if (totalSeconds < 60) return `${totalSeconds}s`;
@@ -183,36 +198,29 @@ export function formatElapsedDuration(ms: number): string {
   return `${minutes}m`;
 }
 
-function isProgressIncrease(
-  previous: Pick<SubagentStatusState, "observedEntries" | "observedBytes">,
-  next: StatusObservation,
-): boolean {
-  if (previous.observedEntries == null || previous.observedBytes == null) {
-    return true;
-  }
-  return next.entries > previous.observedEntries || next.bytes > previous.observedBytes;
-}
-
 export function createStatusState(params: {
   source: SubagentStatusSource;
   startTimeMs: number;
-  cadenceMs: number;
-  baselineEntries?: number | null;
-  baselineBytes?: number | null;
 }): SubagentStatusState {
   const initialKind = params.source === "claude" ? "running" : "starting";
   return {
     source: params.source,
     startTimeMs: params.startTimeMs,
-    cadenceMs: params.cadenceMs,
-    baselineEntries: params.baselineEntries ?? null,
-    baselineBytes: params.baselineBytes ?? null,
-    observedEntries: params.baselineEntries ?? null,
-    observedBytes: params.baselineBytes ?? null,
-    firstObservationAtMs: params.baselineEntries != null ? params.startTimeMs : null,
-    lastProgressAtMs: null,
-    lastCadenceAtMs: params.startTimeMs,
-    lastCadenceEntries: params.baselineEntries ?? null,
+    firstObservationAtMs: null,
+    lastActivityAtMs: null,
+    lastActivitySequence: null,
+    localOverrideAtMs: null,
+    localOverrideSequence: null,
+    activeNow: false,
+    activeSinceMs: null,
+    activeScope: null,
+    waitingSinceMs: null,
+    phase: null,
+    latestEvent: null,
+    activityLabel: null,
+    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotProblemSinceMs: null,
+    snapshotError: null,
     currentKind: initialKind,
   };
 }
@@ -222,41 +230,110 @@ export function observeStatus(
   observation: StatusObservation,
   now: number,
 ): SubagentStatusState {
-  const progressIncrease = isProgressIncrease(state, observation);
-  const baselineEntries = state.baselineEntries ?? 0;
-  const baselineBytes = state.baselineBytes ?? 0;
-  const crossesBaseline = observation.entries > baselineEntries || observation.bytes > baselineBytes;
-  const shouldMarkProgress = progressIncrease && crossesBaseline;
+  if (state.source === "claude") return state;
+
+  if (observation.snapshot !== "present") {
+    return {
+      ...state,
+      firstObservationAtMs: state.firstObservationAtMs ?? now,
+      snapshotState: observation.snapshot,
+      snapshotProblemSinceMs: state.snapshotProblemSinceMs ?? now,
+      snapshotError: observation.snapshotError ?? null,
+    };
+  }
+
+  const updatedAt = observation.updatedAt;
+  const sequence = observation.sequence;
+  const lastActivityAtMs = state.lastActivityAtMs;
+  const lastActivitySequence = state.lastActivitySequence;
+  const olderThanLastActivity = lastActivityAtMs != null && (
+    updatedAt < lastActivityAtMs ||
+    (updatedAt === lastActivityAtMs && lastActivitySequence != null && sequence < lastActivitySequence)
+  );
+  if (olderThanLastActivity) return state;
+
+  const blockedByLocalOverride = state.localOverrideAtMs != null && (
+    updatedAt < state.localOverrideAtMs ||
+    (updatedAt === state.localOverrideAtMs && state.localOverrideSequence != null && sequence <= state.localOverrideSequence)
+  );
+  if (blockedByLocalOverride) return state;
+
+  const phase = observation.phase;
+  const activeNow = phase === "active" || observation.active === true;
+  const activeSinceMs = activeNow
+    ? observation.activeSince ?? state.activeSinceMs ?? updatedAt
+    : null;
+  const waitingSinceMs = phase === "waiting"
+    ? observation.waitingSince ?? state.waitingSinceMs ?? updatedAt
+    : null;
 
   return {
     ...state,
-    observedEntries: observation.entries,
-    observedBytes: observation.bytes,
     firstObservationAtMs: state.firstObservationAtMs ?? now,
-    lastProgressAtMs: shouldMarkProgress ? now : state.lastProgressAtMs,
+    lastActivityAtMs: updatedAt,
+    lastActivitySequence: sequence,
+    activeNow,
+    activeSinceMs,
+    activeScope: activeNow ? observation.activeScope ?? null : null,
+    waitingSinceMs,
+    phase,
+    latestEvent: observation.latestEvent ?? null,
+    activityLabel: observation.activityLabel ?? null,
+    snapshotState: "present",
+    snapshotProblemSinceMs: null,
+    snapshotError: null,
+    localOverrideAtMs: null,
+    localOverrideSequence: null,
   };
 }
 
-export function forceStatusQuiet(state: SubagentStatusState, now: number): SubagentStatusState {
-  // The interrupt path currently applies only to Pi-backed children.
-  // Claude-backed states always classify as `running`, so accidental calls stay a no-op.
+export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
   if (state.source === "claude") return state;
-
-  const quietIdleMs = state.cadenceMs + 1;
-  const maxQuietIdleMs = getStalledAfterMs(state.cadenceMs) - 1;
-  const forcedIdleMs = Math.min(quietIdleMs, maxQuietIdleMs);
-  const forcedProgressAtMs = now - forcedIdleMs;
-  const firstObservationAtMs =
-    state.firstObservationAtMs == null || state.firstObservationAtMs > forcedProgressAtMs
-      ? forcedProgressAtMs
-      : state.firstObservationAtMs;
 
   return {
     ...state,
-    firstObservationAtMs,
-    lastProgressAtMs: forcedProgressAtMs,
-    currentKind: "quiet",
+    firstObservationAtMs: state.firstObservationAtMs ?? now,
+    lastActivityAtMs: now,
+    localOverrideAtMs: now,
+    localOverrideSequence: state.lastActivitySequence,
+    activeNow: false,
+    activeSinceMs: null,
+    activeScope: null,
+    waitingSinceMs: now,
+    phase: "waiting",
+    latestEvent: "interrupt_requested",
+    activityLabel: "interrupted",
+    snapshotState: "present",
+    snapshotProblemSinceMs: null,
+    snapshotError: null,
+    currentKind: "waiting",
   };
+}
+
+function classifyProblemState(state: SubagentStatusState, now: number): Pick<StatusSnapshot, "kind" | "statusLabel"> {
+  const problemLabel = snapshotProblemLabel(state.snapshotState);
+  const hasValidSnapshot = state.lastActivityAtMs != null;
+
+  if (!hasValidSnapshot) {
+    const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
+    const elapsedMs = Math.max(0, now - referenceMs);
+    return elapsedMs >= SNAPSHOT_STALLED_AFTER_MS
+      ? { kind: "stalled", statusLabel: problemLabel }
+      : { kind: "starting", statusLabel: null };
+  }
+
+  const problemSinceMs = state.snapshotProblemSinceMs ?? now;
+  const problemMs = Math.max(0, now - problemSinceMs);
+  if (problemMs >= SNAPSHOT_STALLED_AFTER_MS) return { kind: "stalled", statusLabel: problemLabel };
+
+  const lastHealthyKind = state.activeNow
+    ? "active"
+    : state.waitingSinceMs != null || state.phase === "done"
+      ? "waiting"
+      : state.currentKind === "stalled"
+        ? "starting"
+        : state.currentKind;
+  return { kind: lastHealthyKind, statusLabel: problemLabel };
 }
 
 export function classifyStatus(state: SubagentStatusState, now: number): StatusSnapshot {
@@ -268,46 +345,68 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
       kind: "running",
       elapsedMs,
       elapsedText,
-      idleMs: null,
-      idleText: null,
-      progressEvents: null,
+      activeSinceMs: null,
+      activeDurationText: null,
+      activeScope: null,
+      waitingSinceMs: null,
+      waitingDurationText: null,
+      latestEvent: null,
+      activityLabel: null,
+      snapshotState: state.snapshotState,
+      snapshotError: null,
+      snapshotProblemText: null,
+      statusLabel: null,
     };
   }
 
-  if (state.observedEntries == null || state.observedBytes == null) {
-    const idleStartMs = state.lastProgressAtMs ?? state.firstObservationAtMs ?? state.startTimeMs;
-    const idleMs = Math.max(0, now - idleStartMs);
-    const stalled = idleMs >= getStalledAfterMs(state.cadenceMs);
-    const hasLocalQuietMarker = state.lastProgressAtMs != null;
-    return {
-      kind: stalled ? "stalled" : hasLocalQuietMarker ? "quiet" : "starting",
-      elapsedMs,
-      elapsedText,
-      idleMs,
-      idleText: formatElapsedDuration(idleMs),
-      progressEvents: null,
-    };
+  let kind: SubagentStatusKind;
+  let statusLabel: string | null = null;
+
+  if (state.snapshotState === "present") {
+    if (state.phase === "active" || state.activeNow) {
+      kind = "active";
+    } else if (state.phase === "waiting") {
+      kind = "waiting";
+    } else if (state.phase === "done") {
+      kind = "waiting";
+      statusLabel = "done";
+    } else {
+      const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
+      const elapsedSinceObservationMs = Math.max(0, now - referenceMs);
+      kind = elapsedSinceObservationMs >= SNAPSHOT_STALLED_AFTER_MS ? "stalled" : "starting";
+      statusLabel = null;
+    }
+  } else {
+    const classified = classifyProblemState(state, now);
+    kind = classified.kind;
+    statusLabel = classified.statusLabel;
   }
 
-  const idleStartMs = state.lastProgressAtMs ?? state.firstObservationAtMs ?? state.startTimeMs;
-  const idleMs = Math.max(0, now - idleStartMs);
-  const kind = idleMs >= getStalledAfterMs(state.cadenceMs)
-    ? "stalled"
-    : state.lastProgressAtMs != null && idleMs < state.cadenceMs
-      ? "active"
-      : "quiet";
-  const progressEvents =
-    state.observedEntries != null && state.lastCadenceEntries != null
-      ? Math.max(0, state.observedEntries - state.lastCadenceEntries)
-      : null;
+  const activeDurationText = state.activeSinceMs == null
+    ? null
+    : formatElapsedDuration(now - state.activeSinceMs);
+  const waitingDurationText = state.waitingSinceMs == null
+    ? null
+    : formatElapsedDuration(now - state.waitingSinceMs);
+  const snapshotProblemText = state.snapshotProblemSinceMs == null
+    ? null
+    : formatElapsedDuration(now - state.snapshotProblemSinceMs);
 
   return {
     kind,
     elapsedMs,
     elapsedText,
-    idleMs,
-    idleText: formatElapsedDuration(idleMs),
-    progressEvents,
+    activeSinceMs: state.activeSinceMs,
+    activeDurationText,
+    activeScope: state.activeScope,
+    waitingSinceMs: state.waitingSinceMs,
+    waitingDurationText,
+    latestEvent: state.latestEvent,
+    activityLabel: state.activityLabel,
+    snapshotState: state.snapshotState,
+    snapshotError: state.snapshotError,
+    snapshotProblemText,
+    statusLabel,
   };
 }
 
@@ -318,35 +417,49 @@ export function advanceStatusState(
   nextState: SubagentStatusState;
   snapshot: StatusSnapshot;
   transition: SubagentStatusTransition;
-  cadenceElapsed: boolean;
 } {
   const snapshot = classifyStatus(state, now);
   const transition =
     state.currentKind !== "stalled" && snapshot.kind === "stalled"
       ? "stalled"
-      : state.currentKind === "stalled" && snapshot.kind === "active"
+      : state.currentKind === "stalled" && (snapshot.kind === "active" || snapshot.kind === "waiting")
         ? "recovered"
         : null;
-  const cadenceElapsed = now - state.lastCadenceAtMs >= state.cadenceMs;
 
   return {
     snapshot,
     transition,
-    cadenceElapsed,
     nextState: {
       ...state,
       currentKind: snapshot.kind,
-      lastCadenceAtMs: cadenceElapsed ? now : state.lastCadenceAtMs,
-      lastCadenceEntries: cadenceElapsed ? state.observedEntries : state.lastCadenceEntries,
     },
   };
+}
+
+function formatActiveDetail(snapshot: StatusSnapshot): string {
+  const label = activityLabel(snapshot);
+  if (!label) return "active";
+  const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
+  return `active (${label}${duration})`;
+}
+
+function formatWaitingDetail(snapshot: StatusSnapshot): string {
+  const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
+  return `waiting${duration}`;
+}
+
+function formatStalledDetail(snapshot: StatusSnapshot): string {
+  const detail = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
+  const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
+  return `stalled${duration}${detail}`;
 }
 
 export function formatStatusLine(name: string, snapshot: StatusSnapshot): string {
   const boundedName = normalizeStatusName(name);
 
   if (snapshot.kind === "starting") {
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, starting.`);
+    const label = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
+    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, starting${label}.`);
   }
 
   if (snapshot.kind === "running") {
@@ -354,15 +467,19 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
   }
 
   if (snapshot.kind === "active") {
-    const progress = snapshot.progressEvents && snapshot.progressEvents > 0
-      ? ` (+${snapshot.progressEvents} events)`
-      : "";
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, active${progress}.`);
+    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatActiveDetail(snapshot)}.`);
   }
 
-  return boundStatusLine(
-    `${boundedName} running ${snapshot.elapsedText}, ${snapshot.kind} ${snapshot.idleText}.`,
-  );
+  if (snapshot.kind === "waiting") {
+    const problem = snapshot.statusLabel && snapshot.statusLabel !== "done"
+      ? ` (${snapshot.statusLabel})`
+      : snapshot.statusLabel === "done"
+        ? " (done)"
+        : "";
+    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatWaitingDetail(snapshot)}${problem}.`);
+  }
+
+  return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatStalledDetail(snapshot)}.`);
 }
 
 export function formatTransitionLine(
@@ -373,10 +490,8 @@ export function formatTransitionLine(
   const boundedName = normalizeStatusName(name);
 
   if (transition === "recovered") {
-    const progress = snapshot.progressEvents && snapshot.progressEvents > 0
-      ? ` (+${snapshot.progressEvents} events)`
-      : "";
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, recovered; active${progress}.`);
+    const detail = snapshot.kind === "waiting" ? formatWaitingDetail(snapshot) : formatActiveDetail(snapshot);
+    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, recovered; ${detail}.`);
   }
 
   return formatStatusLine(boundedName, snapshot);

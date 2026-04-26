@@ -6,13 +6,13 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `active`, `quiet`, `stalled`, or `starting`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
-╭─ Subagents ────────────────────────── 2 running ─╮
-│ 00:23  Scout: Auth (scout)       active · 8 msgs │
-│ 00:45  Scout: DB (scout)                quiet 2m │
-╰──────────────────────────────────────────────────╯
+╭─ Subagents ──────────────────────────── 2 running ─╮
+│ 00:23  Scout: Auth (scout)        active · bash 7m │
+│ 00:45  Scout: DB (scout)                waiting 2m │
+╰────────────────────────────────────────────────────╯
 ```
 
 For parallel execution, just call `subagent` multiple times — they all run concurrently:
@@ -102,32 +102,32 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks all running agents:
 
 ```
-╭─ Subagents ─────────────────────────── 3 running ─╮
-│ 01:23  Scout: Auth (scout)       active · 15 msgs │
-│ 00:45  Researcher (researcher)         stalled 4m │
-│ 00:12  Scout: DB (scout)                starting… │
-╰───────────────────────────────────────────────────╯
+╭─ Subagents ───────────────────────────────── 3 running ─╮
+│ 01:23  Scout: Auth (scout)            active · write 7m │
+│ 00:45  Researcher (researcher)               stalled 4m │
+│ 00:12  Scout: DB (scout)                      starting… │
+╰─────────────────────────────────────────────────────────╯
 ```
 
 Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path.
 
 ### In-progress status updates
 
-The widget tracks each sub-agent's progress and labels it with a coarse state:
+The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot and labels it with a coarse state:
 
-- `starting` — launched, but no progress observed yet
-- `active` — recent progress observed
-- `quiet` — still running, but no recent progress
-- `stalled` — no progress for an extended period
-- `running` — fallback for backends without progress tracking (e.g. Claude)
+- `starting` — launched, but no valid child snapshot has been observed yet
+- `active` — the child is doing observed runtime work: agent turn, provider request, streaming, or tool execution
+- `waiting` — the child finished a turn and is intentionally open for more input or another stage
+- `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
+- `running` — fallback for backends without child snapshots (e.g. Claude)
 
-These labels are derived from session-file activity. The `defaultCadenceSeconds` setting controls the idle-time thresholds: with the default of `60`, a run becomes `quiet` after about 1 minute without progress and `stalled` after about 3 minutes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
 
-Status defaults come from `config.json` in the extension directory. Copy `config.json.example` to get started:
+Status display is controlled by `config.json` in the extension directory. Copy `config.json.example` to get started:
 
 ```bash
 cp config.json.example config.json
@@ -136,22 +136,12 @@ cp config.json.example config.json
 ```json
 {
   "status": {
-    "enabled": true,
-    "defaultCadenceSeconds": 60
+    "enabled": true
   }
 }
 ```
 
-`config.json` is gitignored so local overrides don't get committed. You can also override per run:
-
-```typescript
-subagent({
-  name: "Scout",
-  agent: "scout",
-  statusCadenceSeconds: 30,
-  task: "Analyze the auth module",
-});
-```
+`config.json` is gitignored so local overrides don't get committed.
 
 ---
 
@@ -169,9 +159,6 @@ subagent({ name: "Planner", agent: "planner", task: "Work through the design wit
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
-
-// Override the status classification window for this run
-subagent({ name: "Scout", agent: "scout", statusCadenceSeconds: 30, task: "..." });
 ```
 
 ### Parameters
@@ -188,7 +175,6 @@ subagent({ name: "Scout", agent: "scout", statusCadenceSeconds: 30, task: "..." 
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
-| `statusCadenceSeconds` | number  | config default | Idle-time window for status classification (has a minimum floor)                                  |
 
 ---
 
@@ -202,7 +188,7 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget shows the child as `quiet`. If the child makes new progress later, it returns to `active`; completion, failure, and `caller_ping` still flow through normally.
+This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
@@ -364,7 +350,7 @@ Controls whether status transitions (`stalled`, `recovered`) wake the parent ses
 
 **Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
 
-**Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Those natural pauses trip the `stalled` classifier — but the parent session has nothing useful to do with that information, and every transition costs an orchestrator turn. Skipping the steer keeps the parent quiet until the child actually finishes.
+**Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
 
 **When to override:**
 
