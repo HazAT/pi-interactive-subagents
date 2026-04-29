@@ -917,6 +917,80 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("resolves agent models against the available registry before falling back", () => {
+    const modelRegistry = {
+      getAll: () => [
+        { provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+        { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+        { provider: "openai-codex", id: "gpt-5.5", name: "GPT 5.5" },
+      ],
+      getAvailable: () => [
+        { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+        { provider: "openai-codex", id: "gpt-5.5", name: "GPT 5.5" },
+      ],
+    };
+    const mainModel = { provider: "openai-codex", id: "gpt-5.5" };
+
+    const cases: Array<{ requested: string; expected: string }> = [
+      { requested: "anthropic/claude-sonnet-4-5", expected: "anthropic/claude-sonnet-4-5" },
+      { requested: "anthropic/claude-sonnet-4-5:medium", expected: "anthropic/claude-sonnet-4-5:medium" },
+      { requested: "gpt", expected: "openai-codex/gpt-5.5" },
+      { requested: "anthropic/claude-haiku-4-5", expected: "openai-codex/gpt-5.5" },
+      { requested: "anthropic/claude-does-not-exist", expected: "openai-codex/gpt-5.5" },
+    ];
+
+    for (const { requested, expected } of cases) {
+      assert.equal(
+        testApi.resolveEffectiveModel(
+          { name: "A", task: "T" },
+          { model: requested },
+          { modelRegistry, model: mainModel },
+        ),
+        expected,
+        requested,
+      );
+    }
+  });
+
+  it("uses the main session model for agent defaults when the registry is unavailable", () => {
+    const mainModel = { provider: "openai-codex", id: "gpt-5.5" };
+
+    assert.equal(
+      testApi.resolveEffectiveModel(
+        { name: "A", task: "T" },
+        { model: "anthropic/claude-haiku-4-5" },
+        { model: mainModel },
+      ),
+      "openai-codex/gpt-5.5",
+    );
+  });
+
+  it("preserves an explicit model override when the registry is unavailable", () => {
+    const mainModel = { provider: "openai-codex", id: "gpt-5.5" };
+
+    assert.equal(
+      testApi.resolveEffectiveModel(
+        { name: "A", task: "T", model: "anthropic/claude-haiku-4-5" },
+        { model: "openai-codex/gpt-5.5" },
+        { model: mainModel },
+      ),
+      "anthropic/claude-haiku-4-5",
+    );
+  });
+
+  it("resolves fuzzy model names against available models", () => {
+    const modelRegistry = {
+      getAll: () => [
+        { provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+        { provider: "openai-codex", id: "gpt-5.5", name: "GPT 5.5" },
+      ],
+      getAvailable: () => [{ provider: "openai-codex", id: "gpt-5.5", name: "GPT 5.5" }],
+    };
+
+    assert.equal(testApi.resolveAvailableModelReference("gpt", modelRegistry), "openai-codex/gpt-5.5");
+    assert.equal(testApi.modelReferenceExists("anthropic/claude-haiku-4-5", modelRegistry), false);
+  });
+
   it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
     for (const name of ["scout", "worker", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);

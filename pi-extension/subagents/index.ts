@@ -351,6 +351,122 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
+type ModelRegistryModel = ReturnType<ExtensionContext["modelRegistry"]["getAll"]>[number];
+type ModelRegistryLike = Pick<ExtensionContext["modelRegistry"], "getAll"> & {
+  getAvailable?: () => ModelRegistryModel[];
+};
+type CurrentModelLike = ExtensionContext["model"];
+
+function currentModelReference(model: CurrentModelLike): string | undefined {
+  return model ? `${model.provider}/${model.id}` : undefined;
+}
+
+function availableModels(modelRegistry: ModelRegistryLike): ModelRegistryModel[] {
+  return modelRegistry.getAvailable?.() ?? modelRegistry.getAll();
+}
+
+function splitThinkingSuffix(modelReference: string): { base: string; suffix: string } {
+  const lastColon = modelReference.lastIndexOf(":");
+  if (lastColon === -1) return { base: modelReference, suffix: "" };
+  return {
+    base: modelReference.slice(0, lastColon),
+    suffix: modelReference.slice(lastColon),
+  };
+}
+
+function formatModelReference(model: ModelRegistryModel, suffix = ""): string {
+  return `${model.provider}/${model.id}${suffix}`;
+}
+
+function modelScore(model: ModelRegistryModel, query: string): number {
+  const id = model.id.toLowerCase();
+  const provider = model.provider.toLowerCase();
+  const name = String((model as { name?: unknown }).name ?? "").toLowerCase();
+  const full = `${provider}/${id}`;
+
+  if (id === query || full === query) return 100;
+  if (id.includes(query) || full.includes(query)) return 60 + (query.length / id.length) * 30;
+  if (name && name.includes(query)) return 40 + (query.length / name.length) * 20;
+
+  const parts = query.split(/[\s\-/]+/).filter(Boolean);
+  if (
+    parts.length > 0 &&
+    parts.every((part) => id.includes(part) || name.includes(part) || provider.includes(part))
+  ) {
+    return 20;
+  }
+
+  return 0;
+}
+
+function modelReferenceExists(modelReference: string, modelRegistry: ModelRegistryLike): boolean {
+  return resolveAvailableModelReference(modelReference, modelRegistry) != null;
+}
+
+function resolveAvailableModelReference(
+  modelReference: string,
+  modelRegistry: ModelRegistryLike,
+): string | undefined {
+  const models = availableModels(modelRegistry);
+  const requested = modelReference.trim();
+  if (!requested) return undefined;
+  const { base, suffix } = splitThinkingSuffix(requested);
+  const query = base.trim().toLowerCase();
+  if (!query) return undefined;
+
+  const exact = models.find(
+    (model) =>
+      `${model.provider}/${model.id}`.toLowerCase() === query ||
+      model.id.toLowerCase() === query,
+  );
+  if (exact) return formatModelReference(exact, suffix);
+
+  const slashIndex = base.indexOf("/");
+  if (slashIndex !== -1) {
+    const provider = base.slice(0, slashIndex).trim().toLowerCase();
+    const modelId = base.slice(slashIndex + 1).trim().toLowerCase();
+    const providerExact = models.find(
+      (model) => model.provider.toLowerCase() === provider && model.id.toLowerCase() === modelId,
+    );
+    if (providerExact) return formatModelReference(providerExact, suffix);
+  }
+
+  let bestMatch: ModelRegistryModel | undefined;
+  let bestScore = 0;
+  for (const model of models) {
+    const score = modelScore(model, query);
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = model;
+    }
+  }
+
+  return bestMatch && bestScore >= 20 ? formatModelReference(bestMatch, suffix) : undefined;
+}
+
+function resolveEffectiveModel(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  ctx: { modelRegistry?: ModelRegistryLike; model?: CurrentModelLike },
+): string | undefined {
+  const requestedModel = params.model ?? agentDefs?.model;
+  if (!requestedModel) return undefined;
+
+  if (ctx.modelRegistry) {
+    return (
+      resolveAvailableModelReference(requestedModel, ctx.modelRegistry) ??
+      currentModelReference(ctx.model) ??
+      requestedModel
+    );
+  }
+
+  if (params.model) {
+    return requestedModel;
+  }
+
+  return currentModelReference(ctx.model) ?? requestedModel;
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
@@ -846,6 +962,9 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveEffectiveModel,
+  resolveAvailableModelReference,
+  modelReferenceExists,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -874,14 +993,21 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    cwd: string;
+    modelRegistry?: ModelRegistryLike;
+    model?: CurrentModelLike;
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveModel = agentDefs?.cli === "claude"
+    ? (params.model ?? agentDefs?.model)
+    : resolveEffectiveModel(params, agentDefs, ctx);
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
