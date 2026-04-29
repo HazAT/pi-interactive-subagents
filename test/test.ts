@@ -1006,6 +1006,28 @@ describe("subagent discovery", () => {
     assert.equal(testApi.modelReferenceExists("anthropic/claude-haiku-4-5", modelRegistry), false);
   });
 
+  it("sends a visible steer message for model fallback warnings", () => {
+    const { api, sentMessages } = createMockExtensionApi();
+    const warning = {
+      requested: "anthropic/claude-haiku-4-5",
+      used: "openai-codex/gpt-5.5",
+      reason: "unavailable" as const,
+    };
+
+    testApi.notifyModelFallbackWarning(api, {
+      name: "Scout",
+      agent: "scout",
+      modelWarning: warning,
+    });
+
+    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages[0].message.customType, "subagent_model_warning");
+    assert.equal(sentMessages[0].message.display, true);
+    assert.equal(sentMessages[0].message.details.modelWarning, warning);
+    assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+    assert.match(sentMessages[0].message.content, /requested model "anthropic\/claude-haiku-4-5"/);
+  });
+
   it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
     for (const name of ["scout", "worker", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);

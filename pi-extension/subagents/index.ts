@@ -506,6 +506,26 @@ function formatModelFallbackWarning(warning: ModelFallbackWarning): string {
   return `Warning: subagent requested model "${warning.requested}", but ${reason}; using "${warning.used}" instead.`;
 }
 
+function notifyModelFallbackWarning(
+  pi: ExtensionAPI,
+  running: Pick<RunningSubagent, "name" | "agent" | "modelWarning">,
+) {
+  if (!running.modelWarning) return;
+  pi.sendMessage(
+    {
+      customType: "subagent_model_warning",
+      content: formatModelFallbackWarning(running.modelWarning),
+      display: true,
+      details: {
+        name: running.name,
+        agent: running.agent,
+        modelWarning: running.modelWarning,
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
@@ -1006,6 +1026,7 @@ export const __test__ = {
   resolveEffectiveModelResolution,
   resolveAvailableModelReference,
   formatModelFallbackWarning,
+  notifyModelFallbackWarning,
   modelReferenceExists,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -1560,6 +1581,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Launch the subagent (creates pane, sends command)
         const running = await launchSubagent(params, ctx);
+        notifyModelFallbackWarning(pi, running);
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
