@@ -8,6 +8,7 @@
  * - Poll for file creation and screen output
  * - Clean up surfaces and temp files after tests
  */
+import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -32,6 +33,8 @@ import {
   closeSurface,
   sendEscape,
   shellEscape,
+  parseCmuxFocusedSnapshotFromJson,
+  parseCmuxPaneRefForSurfaceFromJson,
   type MuxBackend,
 } from "../../pi-extension/subagents/cmux.ts";
 
@@ -110,6 +113,71 @@ export function restoreBackend(prev: string | undefined): void {
   else process.env.PI_SUBAGENT_MUX = prev;
 }
 
+export function focusSurface(backend: MuxBackend, surface: string): void {
+  if (backend === "cmux") {
+    const pane = getSurfacePane(backend, surface);
+    if (pane) execFileSync("cmux", ["focus-pane", "--pane", pane], { encoding: "utf8" });
+    execFileSync("cmux", ["focus-panel", "--panel", surface], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "tmux") {
+    execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
+    return;
+  }
+
+  throw new Error(`Focus helpers are not implemented for ${backend}`);
+}
+
+export function getFocusedSurface(backend: MuxBackend): string | null {
+  if (backend === "cmux") {
+    const info = execFileSync("cmux", ["identify", "--json"], { encoding: "utf8" });
+    return parseCmuxFocusedSnapshotFromJson(info)?.surfaceRef ?? null;
+  }
+
+  if (backend === "tmux") {
+    try {
+      const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
+        encoding: "utf8",
+      });
+      const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
+      return activeLine?.split(" ")[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  throw new Error(`Focus helpers are not implemented for ${backend}`);
+}
+
+export function getSurfacePane(backend: MuxBackend, surface: string): string | null {
+  if (backend === "cmux") {
+    const info = execFileSync("cmux", ["identify", "--surface", surface], { encoding: "utf8" });
+    return parseCmuxPaneRefForSurfaceFromJson(info, surface);
+  }
+
+  if (backend === "tmux") return surface;
+
+  throw new Error(`Pane lookup is not implemented for ${backend}`);
+}
+
+export async function waitForFocusedSurface(
+  backend: MuxBackend,
+  surface: string,
+  timeout: number = PI_TIMEOUT,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (getFocusedSurface(backend) === surface) return;
+    await sleep(200);
+  }
+
+  throw new Error(
+    `Timeout (${timeout}ms) waiting for focused ${backend} surface ${surface}; ` +
+      `current focus is ${getFocusedSurface(backend) ?? "unknown"}`,
+  );
+}
+
 // ── Test environment ──
 
 export interface TestEnv {
@@ -168,6 +236,17 @@ export function cleanupTestEnv(env: TestEnv): void {
  */
 export function createTrackedSurface(env: TestEnv, name: string): string {
   const surface = createSurface(name);
+  env.surfaces.push(surface);
+  return surface;
+}
+
+export function createTrackedSurfaceSplit(
+  env: TestEnv,
+  name: string,
+  direction: "left" | "right" | "up" | "down",
+  fromSurface?: string,
+): string {
+  const surface = createSurfaceSplit(name, direction, fromSurface);
   env.surfaces.push(surface);
   return surface;
 }

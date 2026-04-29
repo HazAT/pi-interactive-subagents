@@ -17,7 +17,16 @@ import {
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
+import {
+  shellEscape,
+  isCmuxAvailable,
+  isWezTermAvailable,
+  parseCmuxFocusedSnapshot,
+  parseCmuxFocusedSnapshotFromJson,
+  parseCmuxJson,
+  parseCmuxPaneRefForSurface,
+  parseCmuxPaneRefForSurfaceFromJson,
+} from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -1875,6 +1884,105 @@ describe("cmux.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+  });
+
+  describe("parseCmuxFocusedSnapshot", () => {
+    it("parses focused surface and pane refs", () => {
+      assert.deepEqual(
+        parseCmuxFocusedSnapshot({ focused: { surface_ref: "surface:3", pane_ref: "pane:2" } }),
+        { surfaceRef: "surface:3", paneRef: "pane:2" },
+      );
+    });
+
+    it("does not fall back to caller refs", () => {
+      assert.equal(
+        parseCmuxFocusedSnapshot({ caller: { surface_ref: "surface:1", pane_ref: "pane:1" } }),
+        null,
+      );
+    });
+
+    it("returns null for malformed values", () => {
+      assert.equal(parseCmuxFocusedSnapshot(null), null);
+      assert.equal(parseCmuxFocusedSnapshot({ focused: {} }), null);
+    });
+  });
+
+  describe("parseCmuxJson", () => {
+    it("returns null for malformed JSON text", () => {
+      assert.equal(parseCmuxJson("not json"), null);
+    });
+
+    it("parses valid JSON text", () => {
+      assert.deepEqual(parseCmuxJson('{"ok":true}'), { ok: true });
+    });
+  });
+
+  describe("parseCmuxFocusedSnapshotFromJson", () => {
+    it("returns null for malformed JSON text", () => {
+      assert.equal(parseCmuxFocusedSnapshotFromJson("not json"), null);
+    });
+
+    it("returns null when focused is absent or not an object", () => {
+      assert.equal(
+        parseCmuxFocusedSnapshotFromJson('{"focused":null,"caller":{"surface_ref":"surface:1","pane_ref":"pane:1"}}'),
+        null,
+      );
+      assert.equal(
+        parseCmuxFocusedSnapshotFromJson('{"caller":{"surface_ref":"surface:1","pane_ref":"pane:1"}}'),
+        null,
+      );
+    });
+
+    it("parses focused refs without falling back to caller refs", () => {
+      assert.deepEqual(
+        parseCmuxFocusedSnapshotFromJson(
+          '{"caller":{"surface_ref":"surface:1","pane_ref":"pane:1"},"focused":{"surface_ref":"surface:2","pane_ref":"pane:3"}}',
+        ),
+        { surfaceRef: "surface:2", paneRef: "pane:3" },
+      );
+    });
+  });
+
+  describe("parseCmuxPaneRefForSurface", () => {
+    it("parses top-level pane refs for a surface", () => {
+      assert.equal(
+        parseCmuxPaneRefForSurface({ surface_ref: "surface:7", pane_ref: "pane:4" }, "surface:7"),
+        "pane:4",
+      );
+    });
+
+    it("parses caller pane refs for identify --surface output", () => {
+      assert.equal(
+        parseCmuxPaneRefForSurface(
+          { caller: { surface_ref: "surface:7", pane_ref: "pane:4" } },
+          "surface:7",
+        ),
+        "pane:4",
+      );
+    });
+
+    it("returns null when the surface does not match", () => {
+      assert.equal(
+        parseCmuxPaneRefForSurface({ surface_ref: "surface:8", pane_ref: "pane:4" }, "surface:7"),
+        null,
+      );
+    });
+  });
+
+  describe("parseCmuxPaneRefForSurfaceFromJson", () => {
+    it("returns null for malformed JSON text", () => {
+      assert.equal(parseCmuxPaneRefForSurfaceFromJson("not json", "surface:7"), null);
+    });
+
+    it("parses caller refs from cmux identify --surface JSON text", () => {
+      assert.equal(
+        parseCmuxPaneRefForSurfaceFromJson(
+          '{"caller":{"surface_ref":"surface:7","pane_ref":"pane:4"}}',
+          "surface:7",
+        ),
+        "pane:4",
+      );
     });
   });
 
