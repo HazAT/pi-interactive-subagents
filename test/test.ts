@@ -950,18 +950,33 @@ describe("subagent discovery", () => {
         requested,
       );
     }
+
+    assert.deepEqual(
+      testApi.resolveEffectiveModelResolution(
+        { name: "A", task: "T" },
+        { model: "anthropic/claude-haiku-4-5" },
+        { modelRegistry, model: mainModel },
+      ).warning,
+      {
+        requested: "anthropic/claude-haiku-4-5",
+        used: "openai-codex/gpt-5.5",
+        reason: "unavailable",
+      },
+    );
   });
 
   it("uses the main session model for agent defaults when the registry is unavailable", () => {
     const mainModel = { provider: "openai-codex", id: "gpt-5.5" };
+    const resolution = testApi.resolveEffectiveModelResolution(
+      { name: "A", task: "T" },
+      { model: "anthropic/claude-haiku-4-5" },
+      { model: mainModel },
+    );
 
+    assert.equal(resolution.model, "openai-codex/gpt-5.5");
     assert.equal(
-      testApi.resolveEffectiveModel(
-        { name: "A", task: "T" },
-        { model: "anthropic/claude-haiku-4-5" },
-        { model: mainModel },
-      ),
-      "openai-codex/gpt-5.5",
+      testApi.formatModelFallbackWarning(resolution.warning),
+      'Warning: subagent requested model "anthropic/claude-haiku-4-5", but the model registry was unavailable; using "openai-codex/gpt-5.5" instead.',
     );
   });
 

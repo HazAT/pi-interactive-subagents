@@ -356,6 +356,15 @@ type ModelRegistryLike = Pick<ExtensionContext["modelRegistry"], "getAll"> & {
   getAvailable?: () => ModelRegistryModel[];
 };
 type CurrentModelLike = ExtensionContext["model"];
+interface ModelFallbackWarning {
+  requested: string;
+  used: string;
+  reason: "unavailable" | "registry-unavailable";
+}
+interface ModelResolution {
+  model?: string;
+  warning?: ModelFallbackWarning;
+}
 
 function currentModelReference(model: CurrentModelLike): string | undefined {
   return model ? `${model.provider}/${model.id}` : undefined;
@@ -449,22 +458,52 @@ function resolveEffectiveModel(
   agentDefs: AgentDefaults | null,
   ctx: { modelRegistry?: ModelRegistryLike; model?: CurrentModelLike },
 ): string | undefined {
+  return resolveEffectiveModelResolution(params, agentDefs, ctx).model;
+}
+
+function resolveEffectiveModelResolution(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  ctx: { modelRegistry?: ModelRegistryLike; model?: CurrentModelLike },
+): ModelResolution {
   const requestedModel = params.model ?? agentDefs?.model;
-  if (!requestedModel) return undefined;
+  if (!requestedModel) return {};
 
   if (ctx.modelRegistry) {
-    return (
-      resolveAvailableModelReference(requestedModel, ctx.modelRegistry) ??
-      currentModelReference(ctx.model) ??
-      requestedModel
-    );
+    const availableModel = resolveAvailableModelReference(requestedModel, ctx.modelRegistry);
+    if (availableModel) return { model: availableModel };
+
+    const currentModel = currentModelReference(ctx.model);
+    if (currentModel) {
+      return {
+        model: currentModel,
+        warning: { requested: requestedModel, used: currentModel, reason: "unavailable" },
+      };
+    }
+
+    return { model: requestedModel };
   }
 
   if (params.model) {
-    return requestedModel;
+    return { model: requestedModel };
   }
 
-  return currentModelReference(ctx.model) ?? requestedModel;
+  const currentModel = currentModelReference(ctx.model);
+  if (currentModel) {
+    return {
+      model: currentModel,
+      warning: { requested: requestedModel, used: currentModel, reason: "registry-unavailable" },
+    };
+  }
+
+  return { model: requestedModel };
+}
+
+function formatModelFallbackWarning(warning: ModelFallbackWarning): string {
+  const reason = warning.reason === "registry-unavailable"
+    ? "the model registry was unavailable"
+    : "the requested model is not available in this environment";
+  return `Warning: subagent requested model "${warning.requested}", but ${reason}; using "${warning.used}" instead.`;
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -588,6 +627,7 @@ interface RunningSubagent {
   sessionFile: string;
   launchScriptFile?: string;
   activityFile?: string;
+  modelWarning?: ModelFallbackWarning;
   activity?: SubagentActivityState;
   activityRead?: {
     ok: boolean;
@@ -963,7 +1003,9 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   resolveEffectiveModel,
+  resolveEffectiveModelResolution,
   resolveAvailableModelReference,
+  formatModelFallbackWarning,
   modelReferenceExists,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -1005,9 +1047,10 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const modelResolution = resolveEffectiveModelResolution(params, agentDefs, ctx);
   const effectiveModel = agentDefs?.cli === "claude"
     ? (params.model ?? agentDefs?.model)
-    : resolveEffectiveModel(params, agentDefs, ctx);
+    : modelResolution.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1280,6 +1323,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    modelWarning: modelResolution.warning,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1585,11 +1629,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           });
 
         // Return immediately
+        const modelWarningText = running.modelWarning
+          ? `${formatModelFallbackWarning(running.modelWarning)}\n\n`
+          : "";
+
         return {
           content: [
             {
               type: "text",
               text:
+                modelWarningText +
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
@@ -1603,6 +1652,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             agent: params.agent,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
+            ...(running.modelWarning ? { modelWarning: running.modelWarning } : {}),
             status: "started",
           },
         };
