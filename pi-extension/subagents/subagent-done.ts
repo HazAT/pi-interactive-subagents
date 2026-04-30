@@ -14,11 +14,12 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
 }
 
 export function shouldAutoExitOnAgentEnd(
-  userTookOver: boolean,
+  _userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
-  if (userTookOver) return false;
-
+  // Manual input should not strand an auto-exit subagent. If the latest agent
+  // turn completed normally, close the session. Escape/abort still leaves it
+  // open for inspection or another prompt.
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
@@ -146,9 +147,8 @@ export default function (pi: ExtensionAPI) {
 
     recorder.agentEndWaiting();
     if (autoExit) {
-      // User sent input after the agent had started, or the run was interrupted
-      // with Escape. Reset takeover so auto-exit can re-engage on the next
-      // normal completion cycle.
+      // Reset any recorded manual input marker. Auto-exit is decided by whether
+      // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
   });
