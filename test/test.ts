@@ -1406,6 +1406,14 @@ describe("subagent interruption", () => {
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
   });
 
+  it("registers subagent_dismiss in the main session extension", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+
+    (subagentsModule as any).default(api);
+
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_dismiss"), true);
+  });
+
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -1421,6 +1429,62 @@ describe("subagent interruption", () => {
 
       const ambiguous = testApi.resolveInterruptTarget({ name: "Worker" });
       assert.match(ambiguous.error, /Ambiguous subagent name/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("dismisses a running subagent without closing its pane by default", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    let aborted = false;
+    const closedSurfaces: string[] = [];
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({
+        abortController: { abort() { aborted = true; } },
+      }));
+
+      const result = testApi.handleSubagentDismiss({ id: "a1" }, (surface: string) => {
+        closedSurfaces.push(surface);
+      });
+
+      assert.equal(aborted, true);
+      assert.equal(runningMap.has("a1"), false);
+      assert.deepEqual(closedSurfaces, []);
+      assert.match(result.content[0].text, /Dismissed subagent "Worker"/);
+      assert.deepEqual(result.details, {
+        id: "a1",
+        name: "Worker",
+        status: "dismissed",
+        closePane: false,
+      });
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("can dismiss a running subagent and close its pane", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    let aborted = false;
+    const closedSurfaces: string[] = [];
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({
+        abortController: { abort() { aborted = true; } },
+      }));
+
+      const result = testApi.handleSubagentDismiss({ name: "Worker", closePane: true }, (surface: string) => {
+        closedSurfaces.push(surface);
+      });
+
+      assert.equal(aborted, true);
+      assert.equal(runningMap.has("a1"), false);
+      assert.deepEqual(closedSurfaces, ["pane-1"]);
+      assert.equal(result.details.closePane, true);
     } finally {
       runningMap.clear();
     }
