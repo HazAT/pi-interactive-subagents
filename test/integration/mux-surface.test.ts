@@ -1,13 +1,14 @@
 /**
  * Integration tests for the multiplexer surface layer.
  *
- * These tests exercise real cmux/tmux operations: creating panes,
+ * These tests exercise real mux operations: creating panes,
  * sending commands, reading screen output, and closing surfaces.
  * No LLM calls — fast and free.
  *
  * Run inside a supported multiplexer:
  *   cmux bash -c 'npm run test:integration'
  *   tmux new 'npm run test:integration'
+ *   zellij --session pi  # then run: npm run test:integration
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
