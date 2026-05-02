@@ -30,7 +30,7 @@ Run the fast unit tests first — if these fail, skip integration tests:
 cd /Users/haza/Projects/pi-interactive-subagents && node --test test/test.ts
 ```
 
-All 41 unit tests must pass. If any fail, stop and fix them before proceeding.
+All 114 unit tests must pass. If any fail, stop and fix them before proceeding.
 
 ## Step 3: Run Integration Tests
 
@@ -39,8 +39,10 @@ Use cmux to run the integration tests in a dedicated surface so the main session
 ```bash
 SURFACE=$(cmux new-surface --type terminal | awk '{print $2}')
 sleep 0.5
-cmux send --surface $SURFACE 'cd /Users/haza/Projects/pi-interactive-subagents && node --test test/integration/mux-surface.test.ts test/integration/subagent-lifecycle.test.ts 2>&1; echo __TESTS_DONE_$?__\n'
+cmux send --surface $SURFACE 'cd /Users/haza/Projects/pi-interactive-subagents && node --test --test-concurrency=1 test/integration/mux-surface.test.ts test/integration/subagent-lifecycle.test.ts 2>&1; echo __TESTS_DONE_$?__\n'
 ```
+
+`--test-concurrency=1` is required: the focus-preservation test asserts global mux state and would race against parallel suites.
 
 Poll until the sentinel appears:
 
@@ -61,10 +63,12 @@ cmux close-surface --surface $SURFACE
 
 | Suite | Tests | Approx Duration |
 |-------|-------|-----------------|
-| `mux-surface` | 6 | ~25s |
-| `subagent-lifecycle` | 6 | ~60s |
+| `mux-surface` | 8 | ~45s |
+| `subagent-lifecycle` | 7 | ~170s |
 
-All 12 tests must pass. If any fail, report the failure output and stop.
+All 15 tests must pass. If any fail, report the failure output and stop.
+
+The long-running `keeps a long active tool call from surfacing false stalled status` test in `subagent-lifecycle` runs ~100s on its own — total wall time is ~3:30.
 
 ### Configuration
 
@@ -134,7 +138,7 @@ Check each session against these criteria:
 | **No errors** | No `"type": "error"` entries | All sessions |
 | **Clean exit** | No `stopReason: "aborted"` on final assistant message | All sessions |
 | **Parent count** | Multiple parent sessions (one per lifecycle test) | At least 5 parent sessions |
-| **Subagent count** | Multiple subagent sessions spawned | At least 6 subagent sessions (1 echo + 2 parallel + 1 fork + 1 ping + 1 discovery + 1 sysprompt) |
+| **Subagent count** | Multiple subagent sessions spawned | At least 7 subagent sessions (1 echo + 1 long-tool + 2 parallel + 1 fork + 1 ping + 1 discovery + 1 sysprompt) |
 
 Run a comprehensive validation:
 
@@ -230,9 +234,9 @@ Print a final summary:
 ╭─────────────────────────────────────────────╮
 │ Integration Test Results                    │
 ├─────────────────────────────────────────────┤
-│ Unit tests:        41/41 ✅                 │
-│ Mux surface:       6/6  ✅                  │
-│ Subagent lifecycle: 6/6  ✅                 │
+│ Unit tests:        114/114 ✅               │
+│ Mux surface:       8/8  ✅                  │
+│ Subagent lifecycle: 7/7  ✅                 │
 │ Session validation: X sessions verified ✅  │
 │ Fork linkage:      verified ✅              │
 ╰─────────────────────────────────────────────╯
