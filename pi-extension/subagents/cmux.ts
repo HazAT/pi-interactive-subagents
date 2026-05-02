@@ -6,7 +6,7 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -29,7 +29,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm" || pref === "herdr") return pref;
   return null;
 }
 
@@ -49,6 +49,14 @@ function isWezTermRuntimeAvailable(): boolean {
   return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
 }
 
+function isHerdrRuntimeAvailable(): boolean {
+  if (process.env.HERDR_ENV !== "1") return false;
+  const socket = process.env.HERDR_SOCKET_PATH;
+  if (!socket) return false;
+  if (!existsSync(socket)) return false;
+  return hasCommand("herdr");
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -65,13 +73,19 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+export function isHerdrAvailable(): boolean {
+  return isHerdrRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
 
+  if (isHerdrRuntimeAvailable()) return "herdr";
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
@@ -97,7 +111,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "herdr") {
+    return "Start pi inside a herdr pane.";
+  }
+  return "Start pi inside a herdr pane, cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -132,6 +149,77 @@ function tailLines(text: string, lines: number): string {
   const split = text.split("\n");
   if (split.length <= lines) return text;
   return split.slice(-lines).join("\n");
+}
+
+interface HerdrEnvelope {
+  id?: string;
+  type?: string;
+  result?: unknown;
+  error?: { code?: string; message?: string };
+}
+
+function parseHerdrEnvelope(raw: string, args: string[]): unknown {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    // Action commands (send-text, send-keys, pane close, tab rename) return
+    // empty stdout on success. Errors always come through as JSON, so empty
+    // means success.
+    return null;
+  }
+  let data: HerdrEnvelope;
+  try {
+    data = JSON.parse(trimmed) as HerdrEnvelope;
+  } catch {
+    // Some herdr commands may emit plain text (e.g. pane read). Return as-is
+    // so callers can decide how to handle it.
+    return trimmed;
+  }
+  if (data.error) {
+    const msg = data.error.message ?? "unknown error";
+    const code = data.error.code ? ` (${data.error.code})` : "";
+    throw new Error(`herdr ${args.join(" ")}: ${msg}${code}`);
+  }
+  return data.result;
+}
+
+function herdrRpc(args: string[]): unknown {
+  const raw = execFileSync("herdr", args, { encoding: "utf8" });
+  return parseHerdrEnvelope(raw, args);
+}
+
+async function herdrRpcAsync(args: string[]): Promise<unknown> {
+  const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
+  return parseHerdrEnvelope(stdout, args);
+}
+
+// Minimum tail size for herdr reads. pollForExit asks for 5 lines of recent
+// scrollback to scan for the exit sentinel, but starship-style multi-line
+// prompts can push the sentinel past line 5 in the steady state. 50 keeps
+// the sentinel in view across realistic prompt shapes.
+const HERDR_MIN_TAIL_LINES = 50;
+
+function extractHerdrPaneId(result: unknown, args: string[]): string {
+  const r = result as { pane?: { pane_id?: string } } | null;
+  const paneId = r?.pane?.pane_id;
+  if (typeof paneId !== "string" || !paneId) {
+    throw new Error(`herdr ${args.join(" ")}: could not extract pane_id from ${JSON.stringify(result)}`);
+  }
+  return paneId;
+}
+
+function extractHerdrText(result: unknown): string {
+  // pane read may return a {text: "..."} object, a {content: "..."} object,
+  // or a raw string (if the CLI ever emits plain text). Be defensive.
+  if (typeof result === "string") return result;
+  if (result && typeof result === "object") {
+    const obj = result as { text?: unknown; content?: unknown; output?: unknown; lines?: unknown };
+    if (typeof obj.text === "string") return obj.text;
+    if (typeof obj.content === "string") return obj.content;
+    if (typeof obj.output === "string") return obj.output;
+    if (Array.isArray(obj.lines)) return obj.lines.filter((l) => typeof l === "string").join("\n");
+  }
+  // Unknown shape — stringify so caller sees SOMETHING rather than hanging.
+  return JSON.stringify(result);
 }
 
 function zellijPaneId(surface: string): string {
@@ -263,6 +351,25 @@ export function createSurfaceSplit(
 ): string {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    // Each subagent goes in its own tab. Use the caller-supplied name as-is
+    // for both the tab label and (via PI_SUBAGENT_NAME in the spawned pi's
+    // herdr-agent-state) the sidebar agent label. Callers are expected to
+    // pass short, descriptive names like `scout.auth` — see the subagent
+    // tool description. `direction` is a no-op — tabs don't split layouts
+    // directionally.
+    const tabLabel = name?.trim() || "subagent";
+    const createArgs = ["tab", "create", "--cwd", process.cwd(), "--label", tabLabel];
+    const result = herdrRpc(createArgs) as { root_pane?: { pane_id?: string } } | null;
+    const paneId = result?.root_pane?.pane_id;
+    if (!paneId) {
+      throw new Error(
+        `herdr tab create: missing root_pane.pane_id in ${JSON.stringify(result)}`,
+      );
+    }
+    return paneId;
+  }
+
   if (backend === "cmux") {
     const surfaceArg = fromSurface ? ` --surface ${shellEscape(fromSurface)}` : "";
     const out = execSync(`cmux new-split ${direction}${surfaceArg}`, {
@@ -377,6 +484,14 @@ export function createSurfaceSplit(
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    // No-op. Tab labels we own are set at spawn time via createSurfaceSplit
+    // (for subagents in their own tabs). Renaming the parent pi's tab mid-
+    // session — e.g. during /plan — would clobber the herdr-assigned cwd
+    // label unnecessarily. Subagent identity surfaces via sidebar agent.
+    return;
+  }
+
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
     if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
@@ -424,6 +539,13 @@ export function renameCurrentTab(title: string): void {
  */
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    // No-op. herdr workspaces are long-lived and their default label (the
+    // cwd) is more useful than ephemeral plan/session titles. Plan and
+    // subagent identity surface via tab labels and per-pane agent state.
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
@@ -478,6 +600,14 @@ export function renameWorkspace(title: string): void {
 export function sendCommand(surface: string, command: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    // Match the cmux/wezterm pattern: embed the newline in the text payload.
+    // A literal \n at the end of send-text lets the shell treat the line as
+    // submitted without a separate send-keys round-trip.
+    herdrRpc(["pane", "send-text", surface, command + "\n"]);
+    return;
+  }
+
   if (backend === "cmux") {
     execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
       encoding: "utf8",
@@ -509,6 +639,11 @@ export function sendCommand(surface: string, command: string): void {
  */
 export function sendEscape(surface: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    herdrRpc(["pane", "send-keys", surface, "Escape"]);
+    return;
+  }
 
   if (backend === "cmux") {
     execFileSync("cmux", ["send", "--surface", surface, "\u001b"], { encoding: "utf8" });
@@ -574,6 +709,11 @@ export function sendLongCommand(
 export function readScreen(surface: string, lines = 50): string {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    const result = herdrRpc(["pane", "read", surface, "--source", "recent"]);
+    return tailLines(extractHerdrText(result), Math.max(lines, HERDR_MIN_TAIL_LINES));
+  }
+
   if (backend === "cmux") {
     return execSync(`cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`, {
       encoding: "utf8",
@@ -617,6 +757,11 @@ export function readScreen(surface: string, lines = 50): string {
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    const result = await herdrRpcAsync(["pane", "read", surface, "--source", "recent"]);
+    return tailLines(extractHerdrText(result), Math.max(lines, HERDR_MIN_TAIL_LINES));
+  }
+
   if (backend === "cmux") {
     const { stdout } = await execFileAsync(
       "cmux",
@@ -659,6 +804,24 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    // Subagents live in their own tab (see createSurfaceSplit). Close the
+    // whole tab so the tab bar stays tidy. Fallback to pane close if the
+    // tab_id can't be resolved (e.g. pane was moved elsewhere).
+    try {
+      const info = herdrRpc(["pane", "get", surface]) as { pane?: { tab_id?: string } } | null;
+      const tabId = info?.pane?.tab_id;
+      if (tabId) {
+        herdrRpc(["tab", "close", tabId]);
+        return;
+      }
+    } catch {
+      // Fall through to pane close.
+    }
+    herdrRpc(["pane", "close", surface]);
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {
