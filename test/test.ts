@@ -1009,6 +1009,18 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
+    assert.equal(
+      testApi.buildSubagentToolAllowlist("read,bash,web_search"),
+      "read,bash,web_search,caller_ping,subagent_done",
+    );
+  });
+
+  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
+    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  });
+
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
