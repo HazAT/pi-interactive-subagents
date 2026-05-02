@@ -14,7 +14,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/test.ts",
-    "test:integration": "node --test test/integration/*.test.ts"
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
