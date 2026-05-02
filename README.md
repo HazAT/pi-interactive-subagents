@@ -145,6 +145,44 @@ cp config.json.example config.json
 
 ---
 
+### Model & Thinking Overrides via Settings
+
+Override the default model or thinking level for any bundled or custom agent via `settings.json` — no need to edit agent `.md` files or pass `model:` on every spawn.
+
+**Resolution order** (highest → lowest):
+1. Explicit `model` or `thinking` tool parameter
+2. `settings.json` → `subagents.agentOverrides.<agent>.model`/`.thinking`
+3. Agent definition frontmatter (`model:`, `thinking:`)
+
+Supported settings locations (project overrides global):
+
+| Location | Scope |
+|----------|-------|
+| `~/.pi/agent/settings.json` | Global (all projects) |
+| `.pi/settings.json` | Project (current directory) |
+
+Example:
+
+```json
+{
+  "subagents": {
+    "agentOverrides": {
+      "scout": {
+        "model": "llm-gateway/gpt-5.4"
+      },
+      "planner": {
+        "model": "anthropic/claude-opus-4-6",
+        "thinking": "high"
+      }
+    }
+  }
+}
+```
+
+Changes take effect immediately on the next spawn — no `/reload` needed.
+
+---
+
 ## Spawning Subagents
 
 ```typescript

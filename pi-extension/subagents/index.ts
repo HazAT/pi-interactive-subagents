@@ -143,6 +143,17 @@ interface AgentDefaults {
   disableModelInvocation?: boolean;
 }
 
+interface AgentOverrideConfig {
+  model?: string;
+  thinking?: string;
+}
+
+interface AgentSettings {
+  subagents?: {
+    agentOverrides?: Record<string, AgentOverrideConfig>;
+  };
+}
+
 type AgentSource = "package" | "global" | "project";
 
 interface AgentDefinition extends AgentDefaults {
@@ -366,6 +377,42 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   }
 
   return null;
+}
+
+/**
+ * Read global and project-local settings.json to resolve agent overrides.
+ * Project settings override global settings per-agent (shallow merge per agent).
+ */
+function loadAgentSettings(): AgentSettings {
+  const globalPath = join(getAgentConfigDir(), "settings.json");
+  const projectPath = join(process.cwd(), ".pi", "settings.json");
+
+  const readSettings = (path: string): AgentSettings => {
+    if (!existsSync(path)) return {};
+    try {
+      const raw = readFileSync(path, "utf8");
+      return JSON.parse(raw) as AgentSettings;
+    } catch {
+      return {};
+    }
+  };
+
+  const globalSettings = readSettings(globalPath);
+  const projectSettings = readSettings(projectPath);
+
+  if (!globalSettings.subagents?.agentOverrides && !projectSettings.subagents?.agentOverrides) {
+    return {};
+  }
+
+  const mergedOverrides: Record<string, AgentOverrideConfig> = {
+    ...globalSettings.subagents?.agentOverrides,
+  };
+
+  for (const [name, override] of Object.entries(projectSettings.subagents?.agentOverrides ?? {})) {
+    mergedOverrides[name] = { ...mergedOverrides[name], ...override };
+  }
+
+  return { subagents: { agentOverrides: mergedOverrides } };
 }
 
 function formatElapsed(seconds: number): string {
@@ -842,6 +889,7 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
+  loadAgentSettings,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -881,10 +929,12 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const settings = loadAgentSettings();
+  const configOverride = params.agent ? settings.subagents?.agentOverrides?.[params.agent] : undefined;
+  const effectiveModel = params.model ?? configOverride?.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = configOverride?.thinking ?? agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
