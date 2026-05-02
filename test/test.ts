@@ -1398,6 +1398,75 @@ describe("subagent interruption", () => {
     };
   }
 
+  it("closes every tracked subagent on shutdown and tolerates close failures", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closed: string[] = [];
+    const aborted: string[] = [];
+    runningMap.clear();
+    testApi.resetSubagentShutdownStateForSession();
+
+    try {
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "One",
+        surface: "pane-1",
+        abortController: { abort: () => aborted.push("a1") },
+      }));
+      runningMap.set("b2", makeRunning({
+        id: "b2",
+        name: "Two",
+        surface: "pane-2",
+        abortController: { abort: () => aborted.push("b2") },
+      }));
+      runningMap.set("c3", makeRunning({
+        id: "c3",
+        name: "Three",
+        surface: "pane-3",
+        abortController: { abort: () => aborted.push("c3") },
+      }));
+
+      const count = testApi.abortAndCloseRunningSubagents((surface: string) => {
+        closed.push(surface);
+        if (surface === "pane-2") throw new Error("already closed");
+      });
+
+      assert.equal(count, 3);
+      assert.deepEqual(closed, ["pane-1", "pane-2", "pane-3"]);
+      assert.deepEqual(aborted, ["a1", "b2", "c3"]);
+      assert.equal(runningMap.size, 0);
+      assert.equal(testApi.isSubagentShutdownInProgress(), true);
+    } finally {
+      runningMap.clear();
+      testApi.resetSubagentShutdownStateForSession();
+    }
+  });
+
+  it("closes and rejects launch surfaces that resume after shutdown starts", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closed: string[] = [];
+    runningMap.clear();
+    testApi.resetSubagentShutdownStateForSession();
+
+    const running = makeRunning({ id: "launch", surface: "pane-launch" });
+
+    try {
+      testApi.abortAndCloseRunningSubagents(() => {});
+      runningMap.set(running.id, running);
+
+      assert.throws(
+        () => testApi.ensureSubagentLaunchCanContinue(running, (surface: string) => closed.push(surface)),
+        /Session is shutting down/,
+      );
+      assert.deepEqual(closed, ["pane-launch"]);
+      assert.equal(runningMap.has("launch"), false);
+    } finally {
+      runningMap.clear();
+      testApi.resetSubagentShutdownStateForSession();
+    }
+  });
+
   it("registers subagent_interrupt in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();
 
