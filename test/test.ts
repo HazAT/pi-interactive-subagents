@@ -1151,9 +1151,9 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
     });
 
-    it("stays open after user takeover for that cycle", () => {
+    it("auto-exits after normal completion even when the user sent the prompt", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), false);
+      assert.equal(shouldAutoExitOnAgentEnd(true, messages), true);
     });
 
     it("stays open after Escape aborts the run", () => {
