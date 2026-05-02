@@ -159,6 +159,7 @@ interface ListedAgentDefinition extends AgentDefinition {
 const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
+  "subagent_dismiss",
   "subagents_list",
   "subagent_resume",
 ]);
@@ -489,6 +490,12 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /**
+   * Set when the parent intentionally forgets this run without waiting for a
+   * normal child exit. Used for panes killed outside the lifecycle or stale
+   * waiting/stalled widget entries.
+   */
+  dismissed?: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -740,6 +747,55 @@ function requestSubagentInterrupt(
   }
 }
 
+function handleSubagentDismiss(
+  params: { id?: string; name?: string; closePane?: boolean },
+  closeSubagentSurface: (surface: string) => void = closeSurface,
+) {
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
+
+  const running = resolved.running;
+  running.dismissed = true;
+  runningSubagents.delete(running.id);
+  running.abortController?.abort();
+
+  let closeError: string | undefined;
+  if (params.closePane) {
+    try {
+      closeSubagentSurface(running.surface);
+    } catch (error: any) {
+      closeError = error?.message ?? String(error);
+    }
+  }
+
+  updateWidget();
+
+  const closeText = params.closePane
+    ? closeError
+      ? ` Tried to close its pane, but that failed: ${closeError}`
+      : " Its pane was also closed."
+    : " Its pane was left alone.";
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Dismissed subagent "${running.name}" from status tracking.${closeText}`,
+    }],
+    details: {
+      id: running.id,
+      name: running.name,
+      status: "dismissed",
+      closePane: !!params.closePane,
+      ...(closeError ? { closeError } : {}),
+    },
+  };
+}
+
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
   sendEscapeKey: (surface: string) => void = sendEscape,
@@ -857,6 +913,7 @@ export const __test__ = {
   resolveDenyTools,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  handleSubagentDismiss,
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
@@ -1280,6 +1337,19 @@ async function watchSubagent(
       ping: result.ping,
     };
   } catch (err: any) {
+    if (running.dismissed) {
+      runningSubagents.delete(running.id);
+      return {
+        name,
+        task,
+        summary: "Subagent dismissed.",
+        exitCode: 0,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: "dismissed",
+        sessionFile,
+      };
+    }
+
     try {
       closeSurface(surface);
     } catch {}
@@ -1410,6 +1480,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            if (running.dismissed) return;
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -1586,6 +1657,63 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
               theme.fg("dim", " — interrupt requested"),
+            0,
+            0,
+          );
+        }
+
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_dismiss tool ──
+  if (shouldRegister("subagent_dismiss"))
+    pi.registerTool({
+      name: "subagent_dismiss",
+      label: "Dismiss Subagent",
+      description:
+        "Remove a running subagent from parent status tracking without waiting for a normal child exit. " +
+        "Use when a child pane was killed externally, got stuck waiting, or otherwise cannot report completion. " +
+        "Optionally also close the pane. This does not emit a subagent_result.",
+      promptSnippet:
+        "Remove a running subagent from parent status tracking without waiting for a normal child exit. " +
+        "Use when a child pane was killed externally, got stuck waiting, or otherwise cannot report completion. " +
+        "Optionally also close the pane. This does not emit a subagent_result.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        closePane: Type.Optional(Type.Boolean({
+          description: "Also close the subagent pane/tab. Defaults to false.",
+        })),
+      }),
+
+      async execute(_toolCallId, params) {
+        return handleSubagentDismiss(params);
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        const closeHint = args.closePane ? theme.fg("dim", " + close pane") : "";
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", " — dismiss") +
+            closeHint,
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.status === "dismissed") {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
+              theme.fg("dim", " — dismissed"),
             0,
             0,
           );
@@ -1835,6 +1963,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+            if (running.dismissed) return;
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
