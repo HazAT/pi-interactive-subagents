@@ -200,8 +200,14 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
 
-**Parameters:**
+**`caller_ping` parameters:**
 - `message` (required): What you need help with
+
+**`subagent_resume` parameters:**
+- `sessionPath` (required): Path to the child session `.jsonl` file
+- `name` (optional): Display name for the resumed pane (defaults to `Resume`)
+- `message` (optional): Follow-up prompt to send after resuming
+- `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`

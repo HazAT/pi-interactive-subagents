@@ -837,6 +837,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
+function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
+  const autoExit = params.autoExit ?? true;
+  return { autoExit, interactive: !autoExit };
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -854,6 +859,7 @@ export const __test__ = {
   requestSubagentInterrupt,
   handleSubagentInterrupt,
   resolveResultPresentation,
+  resolveResumeLaunchBehavior,
   runningSubagents,
 };
 
@@ -1671,6 +1677,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             description: "Optional message to send after resuming (e.g. follow-up instructions)",
           }),
         ),
+        autoExit: Type.Optional(
+          Type.Boolean({
+            description:
+              "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+          }),
+        ),
       }),
 
       renderCall(args, theme) {
@@ -1704,6 +1716,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const name = params.name ?? "Resume";
+        const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
@@ -1768,6 +1781,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        if (autoExit) {
+          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+        }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -1802,7 +1818,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           launchScriptFile,
           activityFile,
-          interactive: true,
+          interactive,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,

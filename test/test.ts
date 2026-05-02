@@ -1180,6 +1180,19 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior({}), {
+      autoExit: true,
+      interactive: false,
+    });
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), {
+      autoExit: false,
+      interactive: true,
+    });
+  });
+
   it("expands spawning false to deny subagent interruption", () => {
     const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
@@ -1208,6 +1221,18 @@ describe("tool registration", () => {
     const output = rendered.render(80).join("\n");
 
     assert.match(output, /\(unnamed\)/);
+  });
+
+  it("registers subagent_resume with an autoExit override", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+    assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+
+    const autoExitSchema = resumeTool.parameters.properties.autoExit;
+    assert.equal(autoExitSchema.type, "boolean");
+    assert.match(autoExitSchema.description, /Defaults to true/);
   });
 });
 
