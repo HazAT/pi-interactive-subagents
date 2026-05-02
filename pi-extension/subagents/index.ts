@@ -3,6 +3,7 @@ import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   readdirSync,
   readFileSync,
@@ -27,6 +28,7 @@ import {
   renameWorkspace,
   readScreen,
 } from "./cmux.ts";
+
 import {
   findLastAssistantMessage,
   getNewEntries,
@@ -51,6 +53,9 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+
+/** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
+const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -196,7 +201,7 @@ function getAgentConfigDir(): string {
 }
 
 function getBundledAgentsDir(): string {
-  return join(dirname(new URL(import.meta.url).pathname), "../../agents");
+  return join(SUBAGENTS_DIR, "../../agents");
 }
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
@@ -984,7 +989,7 @@ async function launchSubagent(
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
-    const pluginDir = join(dirname(new URL(import.meta.url).pathname), "plugin");
+    const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
@@ -1060,7 +1065,7 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
+  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
   if (effectiveModel) {
@@ -1764,10 +1769,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(
-          dirname(new URL(import.meta.url).pathname),
-          "subagent-done.ts",
-        );
+        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
 
         const sessionId = ctx.sessionManager.getSessionId();
@@ -2124,7 +2126,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       // Load the plan skill from the subagents extension directory
-      const planSkillPath = join(dirname(new URL(import.meta.url).pathname), "plan-skill.md");
+      const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
       let content = readFileSync(planSkillPath, "utf8");
       content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
       pi.sendUserMessage(
