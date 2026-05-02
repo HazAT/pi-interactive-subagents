@@ -128,6 +128,11 @@ function writeAgentFile(
   writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
 }
 
+function writeSettingsFile(settingsPath: string, data: object) {
+  mkdirSync(settingsPath, { recursive: true });
+  writeFileSync(join(settingsPath, "settings.json"), JSON.stringify(data, null, 2));
+}
+
 async function withIsolatedAgentEnv(
   fn: (paths: {
     projectDir: string;
@@ -952,6 +957,83 @@ describe("subagent discovery", () => {
       const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, undefined);
+    });
+  });
+
+  it("loadAgentSettings returns empty when no settings files exist", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const settings = testApi.loadAgentSettings();
+      assert.deepEqual(settings, {});
+    });
+  });
+
+  it("loadAgentSettings reads global settings.json", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: {
+            scout: { model: "llm-gateway/gpt-5.4" },
+          },
+        },
+      });
+
+      const settings = testApi.loadAgentSettings();
+      assert.equal(settings.subagents?.agentOverrides?.scout?.model, "llm-gateway/gpt-5.4");
+    });
+  });
+
+  it("loadAgentSettings project overrides global per-agent", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: {
+            scout: { model: "llm-gateway/gpt-5.4" },
+            worker: { model: "llm-gateway/Kimi-K2.6" },
+          },
+        },
+      });
+      writeSettingsFile(join(projectDir, ".pi"), {
+        subagents: {
+          agentOverrides: {
+            scout: { model: "anthropic/claude-sonnet-4-6" },
+          },
+        },
+      });
+
+      const settings = testApi.loadAgentSettings();
+      assert.equal(settings.subagents?.agentOverrides?.scout?.model, "anthropic/claude-sonnet-4-6");
+      assert.equal(settings.subagents?.agentOverrides?.worker?.model, "llm-gateway/Kimi-K2.6");
+    });
+  });
+
+  it("loadAgentSettings merges model and thinking per-agent from global and project", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: {
+            scout: { model: "llm-gateway/gpt-5.4" },
+          },
+        },
+      });
+      writeSettingsFile(join(projectDir, ".pi"), {
+        subagents: {
+          agentOverrides: {
+            scout: { thinking: "high" },
+          },
+        },
+      });
+
+      const settings = testApi.loadAgentSettings();
+      assert.equal(settings.subagents?.agentOverrides?.scout?.model, "llm-gateway/gpt-5.4");
+      assert.equal(settings.subagents?.agentOverrides?.scout?.thinking, "high");
+    });
+  });
+
+  it("loadAgentSettings ignores malformed settings.json", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeFileSync(join(globalDir, "settings.json"), "not json");
+      const settings = testApi.loadAgentSettings();
+      assert.deepEqual(settings, {});
     });
   });
 
