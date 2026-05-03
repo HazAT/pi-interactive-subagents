@@ -6,7 +6,7 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "con";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,7 +43,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm" || pref === "con") return pref;
   return null;
 }
 
@@ -63,6 +63,18 @@ function isWezTermRuntimeAvailable(): boolean {
   return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
 }
 
+function isConRuntimeAvailable(): boolean {
+  if (!hasCommand("con-cli")) return false;
+  const result = spawnSync("con-cli", ["--json", "identify"], { encoding: "utf8" });
+  if (result.error || result.status !== 0 || !result.stdout.trim()) return false;
+  try {
+    const parsed = JSON.parse(result.stdout) as { app?: unknown };
+    return parsed.app === "con";
+  } catch {
+    return false;
+  }
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -79,17 +91,23 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+export function isConAvailable(): boolean {
+  return isConRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "con") return isConRuntimeAvailable() ? "con" : null;
 
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isConRuntimeAvailable()) return "con";
   return null;
 }
 
@@ -111,7 +129,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "con") {
+    return "Start pi inside con-terminal.";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or con-terminal.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -201,6 +222,187 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 
 /** Tracked subagent pane for cmux — reused across subagent launches. */
 let cmuxSubagentPane: string | null = null;
+
+const CON_OWNER = "pi-interactive-subagents";
+
+type ConPaneTarget = { tabIndex: number; paneId: number };
+type ConCreatedSurface = ConPaneTarget & { surfaceId: string; createdPane: boolean };
+
+/** Tracked subagent pane for con — reused across subagent launches in this Pi process. */
+let conSubagentPane: ConPaneTarget | null = null;
+
+function conJsonSync<T = any>(args: string[]): T {
+  const output = execFileSync("con-cli", ["--json", ...args], { encoding: "utf8" }).trim();
+  if (!output) throw new Error(`Unexpected con-cli ${args.join(" ")} output: empty`);
+  return JSON.parse(output) as T;
+}
+
+async function conJsonAsync<T = any>(args: string[]): Promise<T> {
+  const { stdout } = await execFileAsync("con-cli", ["--json", ...args], { encoding: "utf8" });
+  const output = stdout.trim();
+  if (!output) throw new Error(`Unexpected con-cli ${args.join(" ")} output: empty`);
+  return JSON.parse(output) as T;
+}
+
+function conNumericId(value: unknown, context: string): string {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return String(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) return value;
+  throw new Error(`Unexpected con ${context}: ${String(value || "(empty)")}`);
+}
+
+function parseConCreatedSurface(value: unknown, command: string): ConCreatedSurface {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Unexpected con ${command} output: not an object`);
+  }
+
+  const record = value as {
+    surface_id?: unknown;
+    pane_id?: unknown;
+    tab_index?: unknown;
+    created_pane?: unknown;
+  };
+
+  return {
+    surfaceId: conNumericId(record.surface_id, `${command} surface_id`),
+    paneId: Number(conNumericId(record.pane_id, `${command} pane_id`)),
+    tabIndex: Number(conNumericId(record.tab_index, `${command} tab_index`)),
+    createdPane: record.created_pane === true,
+  };
+}
+
+function readConTree(): any {
+  return conJsonSync(["tree"]);
+}
+
+function findConSurfaceInTree(surfaceId: string): ConPaneTarget | null {
+  const tree = readConTree();
+  const tabs = Array.isArray(tree?.tabs) ? tree.tabs : [];
+  for (const tab of tabs) {
+    const panes = Array.isArray(tab?.panes) ? tab.panes : [];
+    for (const pane of panes) {
+      const surfaces = Array.isArray(pane?.surfaces) ? pane.surfaces : [];
+      if (surfaces.some((surface: any) => String(surface?.surface_id) === surfaceId)) {
+        return {
+          tabIndex: Number(conNumericId(tab?.tab_index, "tree tab_index")),
+          paneId: Number(conNumericId(pane?.pane_id, "tree pane_id")),
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function focusedConPane(): ConPaneTarget {
+  const tree = readConTree();
+  const tabs = Array.isArray(tree?.tabs) ? tree.tabs : [];
+  const tab = tabs.find((candidate: any) => candidate?.is_active) ?? tabs[0];
+  if (!tab) throw new Error("Unexpected con tree output: no tabs");
+
+  const panes = Array.isArray(tab?.panes) ? tab.panes : [];
+  const pane = panes.find((candidate: any) => candidate?.is_focused) ?? panes[0];
+  if (!pane) throw new Error("Unexpected con tree output: no panes");
+
+  return {
+    tabIndex: Number(conNumericId(tab.tab_index, "tree tab_index")),
+    paneId: Number(conNumericId(pane.pane_id, "tree pane_id")),
+  };
+}
+
+function conLaunchPane(): ConPaneTarget {
+  // Subagents launched by this extension receive their surface id in PI_SUBAGENT_SURFACE.
+  // con currently exposes no CON_* env vars, so nested subagents use that propagated id
+  // to anchor their own first split to the child process's pane instead of user focus.
+  const currentSurface = process.env.PI_SUBAGENT_SURFACE;
+  if (currentSurface && /^\d+$/.test(currentSurface)) {
+    const target = findConSurfaceInTree(currentSurface);
+    if (target) return target;
+  }
+  return focusedConPane();
+}
+
+function conPaneExists(target: ConPaneTarget): boolean {
+  const result = spawnSync(
+    "con-cli",
+    [
+      "--json",
+      "surfaces",
+      "list",
+      "--tab",
+      String(target.tabIndex),
+      "--pane-id",
+      String(target.paneId),
+    ],
+    { encoding: "utf8" },
+  );
+  if (result.error || result.status !== 0 || !result.stdout.trim()) return false;
+  try {
+    const output = JSON.parse(result.stdout) as { surfaces?: unknown };
+    return Array.isArray(output.surfaces);
+  } catch {
+    return false;
+  }
+}
+
+function waitForConSurfaceReady(surface: string): void {
+  conJsonSync([
+    "surfaces",
+    "wait-ready",
+    "--surface-id",
+    surface,
+    "--timeout",
+    "10",
+  ]);
+}
+
+function createConSurfaceInPane(name: string, target: ConPaneTarget): ConCreatedSurface {
+  const created = parseConCreatedSurface(
+    conJsonSync([
+      "surfaces",
+      "create",
+      "--tab",
+      String(target.tabIndex),
+      "--pane-id",
+      String(target.paneId),
+      "--title",
+      name,
+      "--owner",
+      CON_OWNER,
+    ]),
+    "surfaces create",
+  );
+  waitForConSurfaceReady(created.surfaceId);
+  return created;
+}
+
+function createConSplitSurface(
+  name: string,
+  direction: "left" | "right" | "up" | "down" = "right",
+  fromSurface?: string,
+): ConCreatedSurface {
+  const target = fromSurface && /^\d+$/.test(fromSurface)
+    ? findConSurfaceInTree(fromSurface) ?? conLaunchPane()
+    : conLaunchPane();
+  const location = direction === "up" || direction === "down" ? "down" : "right";
+  const created = parseConCreatedSurface(
+    conJsonSync([
+      "surfaces",
+      "split",
+      "--tab",
+      String(target.tabIndex),
+      "--pane-id",
+      String(target.paneId),
+      "--location",
+      location,
+      "--title",
+      name,
+      "--owner",
+      CON_OWNER,
+    ]),
+    "surfaces split",
+  );
+  waitForConSurfaceReady(created.surfaceId);
+  return created;
+}
 
 // Mirrors Zellij 0.44.x tab minimums, used to predict which pane Zellij itself
 // will choose for a directionless split.
@@ -746,10 +948,12 @@ function createCmuxSplitSurface(
  *
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
+ * For con: the first call creates a right-split pane; subsequent calls add
+ * surfaces to that same pane.
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For tmux/wezterm: falls back to split behavior.
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `42` in con).
  */
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
@@ -770,6 +974,19 @@ export function createSurface(name: string): string {
     const created = createCmuxSplitSurface(name, "right", process.env.CMUX_SURFACE_ID);
     cmuxSubagentPane = created.paneRef ?? null;
     return created.surface;
+  }
+
+  if (backend === "con" && conSubagentPane) {
+    if (conPaneExists(conSubagentPane)) {
+      return createConSurfaceInPane(name, conSubagentPane).surfaceId;
+    }
+    conSubagentPane = null;
+  }
+
+  if (backend === "con") {
+    const created = createConSplitSurface(name, "right", process.env.PI_SUBAGENT_SURFACE);
+    conSubagentPane = { tabIndex: created.tabIndex, paneId: created.paneId };
+    return created.surfaceId;
   }
 
   if (backend === "zellij") {
@@ -810,7 +1027,7 @@ function createSurfaceInPane(name: string, pane: string): string {
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm/con).
  */
 export function createSurfaceSplit(
   name: string,
@@ -821,6 +1038,10 @@ export function createSurfaceSplit(
 
   if (backend === "cmux") {
     return createCmuxSplitSurface(name, direction, fromSurface).surface;
+  }
+
+  if (backend === "con") {
+    return createConSplitSurface(name, direction, fromSurface).surfaceId;
   }
 
   if (backend === "tmux") {
@@ -941,6 +1162,14 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "con") {
+    const surface = process.env.PI_SUBAGENT_SURFACE;
+    if (surface && /^\d+$/.test(surface)) {
+      conJsonSync(["surfaces", "rename", "--surface-id", surface, title]);
+    }
+    return;
+  }
+
   // zellij: rename the agent's own pane, not the whole tab. In multi-pane layouts,
   // rename-tab clobbers the user's tab title whenever a subagent starts or /plan runs.
   // Closes #21.
@@ -996,6 +1225,11 @@ export function renameWorkspace(title: string): void {
     return;
   }
 
+  if (backend === "con") {
+    // con does not currently expose a workspace/session rename operation through con-cli.
+    return;
+  }
+
   // Skip session rename for zellij. rename-session renames the socket file
   // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
   // name, so all subsequent `zellij action ...` CLI calls fail with
@@ -1033,6 +1267,12 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "con") {
+    conJsonSync(["surfaces", "send-text", "--surface-id", surface, command]);
+    conJsonSync(["surfaces", "send-key", "--surface-id", surface, "enter"]);
+    return;
+  }
+
   zellijActionSync(["write-chars", command], surface);
   zellijActionSync(["write", "13"], surface);
 }
@@ -1057,6 +1297,11 @@ export function sendEscape(surface: string): void {
     execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", "\u001b"], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "con") {
+    conJsonSync(["surfaces", "send-key", "--surface-id", surface, "escape"]);
     return;
   }
 
@@ -1132,6 +1377,18 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
+  if (backend === "con") {
+    const result = conJsonSync<{ content?: unknown }>([
+      "surfaces",
+      "read",
+      "--surface-id",
+      surface,
+      "--lines",
+      String(lines),
+    ]);
+    return typeof result.content === "string" ? result.content : "";
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
   // and --path may silently fail to create the file. Stdout capture is robust.
@@ -1177,6 +1434,18 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return tailLines(stdout, lines);
   }
 
+  if (backend === "con") {
+    const result = await conJsonAsync<{ content?: unknown }>([
+      "surfaces",
+      "read",
+      "--surface-id",
+      surface,
+      "--lines",
+      String(lines),
+    ]);
+    return typeof result.content === "string" ? result.content : "";
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
   const { stdout } = await execFileAsync(
@@ -1209,6 +1478,14 @@ export function closeSurface(surface: string): void {
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "con") {
+    conJsonSync(["surfaces", "close", "--surface-id", surface, "--close-empty-owned-pane"]);
+    if (conSubagentPane && !conPaneExists(conSubagentPane)) {
+      conSubagentPane = null;
+    }
     return;
   }
 

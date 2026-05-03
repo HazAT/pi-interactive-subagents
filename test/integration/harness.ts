@@ -2,7 +2,7 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux, zellij)
+ * - Detect available mux backends (cmux, tmux, zellij, con)
  * - Create isolated test environments with test agent definitions
  * - Start real pi sessions in mux surfaces
  * - Poll for file creation and screen output
@@ -89,7 +89,7 @@ export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  for (const backend of ["cmux", "tmux", "zellij", "con"] as MuxBackend[]) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -126,6 +126,13 @@ export function focusSurface(backend: MuxBackend, surface: string): void {
     return;
   }
 
+  if (backend === "con") {
+    execFileSync("con-cli", ["--json", "surfaces", "focus", "--surface-id", surface], {
+      encoding: "utf8",
+    });
+    return;
+  }
+
   throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
@@ -147,6 +154,18 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
     }
   }
 
+  if (backend === "con") {
+    try {
+      const tree = JSON.parse(execFileSync("con-cli", ["--json", "tree"], { encoding: "utf8" }));
+      const tab = tree.tabs?.find((candidate: any) => candidate?.is_active) ?? tree.tabs?.[0];
+      const pane = tab?.panes?.find((candidate: any) => candidate?.is_focused) ?? tab?.panes?.[0];
+      const surface = pane?.surfaces?.find((candidate: any) => candidate?.is_active) ?? pane?.surfaces?.[0];
+      return surface?.surface_id != null ? String(surface.surface_id) : null;
+    } catch {
+      return null;
+    }
+  }
+
   throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
@@ -157,6 +176,22 @@ export function getSurfacePane(backend: MuxBackend, surface: string): string | n
   }
 
   if (backend === "tmux") return surface;
+
+  if (backend === "con") {
+    try {
+      const tree = JSON.parse(execFileSync("con-cli", ["--json", "tree"], { encoding: "utf8" }));
+      for (const tab of tree.tabs ?? []) {
+        for (const pane of tab.panes ?? []) {
+          if ((pane.surfaces ?? []).some((candidate: any) => String(candidate?.surface_id) === surface)) {
+            return pane.pane_id != null ? String(pane.pane_id) : null;
+          }
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
 
   throw new Error(`Pane lookup is not implemented for ${backend}`);
 }
