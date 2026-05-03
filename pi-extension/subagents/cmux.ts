@@ -367,7 +367,6 @@ function createConSurfaceInPane(name: string, target: ConPaneTarget): ConCreated
       name,
       "--owner",
       CON_OWNER,
-      "--close-pane-when-last",
     ]),
     "surfaces create",
   );
@@ -398,7 +397,6 @@ function createConSplitSurface(
       name,
       "--owner",
       CON_OWNER,
-      "--close-pane-when-last",
     ]),
     "surfaces split",
   );
