@@ -530,6 +530,7 @@ function createZellijSurface(name: string): string {
 type CmuxFocusSnapshot = {
   surfaceRef?: string;
   paneRef?: string;
+  workspaceRef?: string;
 };
 
 type CmuxCreatedSurface = {
@@ -552,12 +553,13 @@ export function parseCmuxFocusedSnapshot(value: unknown): CmuxFocusSnapshot | nu
   const focused = (value as { focused?: unknown }).focused;
   if (!focused || typeof focused !== "object") return null;
 
-  const record = focused as { surface_ref?: unknown; pane_ref?: unknown };
+  const record = focused as { surface_ref?: unknown; pane_ref?: unknown; workspace_ref?: unknown };
   const surfaceRef = nonEmptyString(record.surface_ref) ? record.surface_ref : undefined;
   const paneRef = nonEmptyString(record.pane_ref) ? record.pane_ref : undefined;
+  const workspaceRef = nonEmptyString(record.workspace_ref) ? record.workspace_ref : undefined;
 
-  if (!surfaceRef && !paneRef) return null;
-  return { surfaceRef, paneRef };
+  if (!surfaceRef && !paneRef && !workspaceRef) return null;
+  return { surfaceRef, paneRef, ...(workspaceRef ? { workspaceRef } : {}) };
 }
 
 export function parseCmuxJson(value: string): unknown | null {
@@ -579,12 +581,13 @@ function parseCmuxCallerSnapshot(value: unknown): CmuxFocusSnapshot | null {
   const caller = (value as { caller?: unknown }).caller;
   if (!caller || typeof caller !== "object") return null;
 
-  const record = caller as { surface_ref?: unknown; pane_ref?: unknown };
+  const record = caller as { surface_ref?: unknown; pane_ref?: unknown; workspace_ref?: unknown };
   const surfaceRef = nonEmptyString(record.surface_ref) ? record.surface_ref : undefined;
   const paneRef = nonEmptyString(record.pane_ref) ? record.pane_ref : undefined;
+  const workspaceRef = nonEmptyString(record.workspace_ref) ? record.workspace_ref : undefined;
 
-  if (!surfaceRef && !paneRef) return null;
-  return { surfaceRef, paneRef };
+  if (!surfaceRef && !paneRef && !workspaceRef) return null;
+  return { surfaceRef, paneRef, ...(workspaceRef ? { workspaceRef } : {}) };
 }
 
 export function parseCmuxPaneRefForSurface(value: unknown, surface: string): string | null {
@@ -710,6 +713,34 @@ function renameCmuxSurface(surface: string, name: string): void {
   execFileSync("cmux", ["rename-tab", "--surface", surface, name], { encoding: "utf8" });
 }
 
+function isCmuxCallerWorkspaceHidden(snapshot: CmuxIdentifySnapshot): boolean {
+  const callerWorkspace = snapshot.caller?.workspaceRef;
+  const focusedWorkspace = snapshot.focused?.workspaceRef;
+  return !!callerWorkspace && !!focusedWorkspace && callerWorkspace !== focusedWorkspace;
+}
+
+/**
+ * Wake a freshly-created cmux surface before sending the real launch command.
+ *
+ * cmux lazily initializes terminal surfaces in workspaces that are not currently
+ * focused. If the first text sent to such a surface is the real command, cmux
+ * may render that text before shell startup and never evaluate it. A harmless
+ * newline forces initialization without changing focus; the existing shell-ready
+ * delay can then wait for the prompt normally.
+ */
+function wakeCmuxSurfaceForInputIfCallerHidden(
+  surface: string,
+  identifySnapshot: CmuxIdentifySnapshot,
+): void {
+  if (!isCmuxCallerWorkspaceHidden(identifySnapshot)) return;
+
+  try {
+    execFileSync("cmux", ["send", "--surface", surface, "\n"], { encoding: "utf8" });
+  } catch {
+    // Best effort. Normal focused surfaces and already-initialized terminals do not need this.
+  }
+}
+
 function createCmuxSplitSurface(
   name: string,
   direction: "left" | "right" | "up" | "down",
@@ -728,6 +759,7 @@ function createCmuxSplitSurface(
     child = parseCmuxCreatedSurface(output, "new-split");
     child.paneRef ??= readCmuxPaneRefForSurface(child.surface) ?? undefined;
     renameCmuxSurface(child.surface, name);
+    wakeCmuxSurfaceForInputIfCallerHidden(child.surface, identifySnapshot);
     return child;
   } finally {
     if (child) {
@@ -796,6 +828,7 @@ function createSurfaceInPane(name: string, pane: string): string {
     child = parseCmuxCreatedSurface(output, "new-surface");
     child.paneRef ??= pane;
     renameCmuxSurface(child.surface, name);
+    wakeCmuxSurfaceForInputIfCallerHidden(child.surface, identifySnapshot);
     return child.surface;
   } finally {
     if (child) {
