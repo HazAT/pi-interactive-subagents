@@ -12,6 +12,7 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { unlinkSync } from "node:fs";
 import {
   getAvailableBackends,
@@ -40,6 +41,24 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
+function cmuxIdentify(): {
+  caller?: { workspace_ref?: string };
+  focused?: { workspace_ref?: string };
+} {
+  return JSON.parse(execFileSync("cmux", ["identify", "--json"], { encoding: "utf8" }));
+}
+
+function cmuxWorkspaceRefs(): string[] {
+  return execFileSync("cmux", ["list-workspaces"], { encoding: "utf8" })
+    .split("\n")
+    .map((line) => line.match(/workspace:\d+/)?.[0])
+    .filter((workspace): workspace is string => !!workspace);
+}
+
+function cmuxSelectWorkspace(workspace: string): void {
+  execFileSync("cmux", ["select-workspace", "--workspace", workspace], { encoding: "utf8" });
+}
+
 const backends = getAvailableBackends();
 const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
@@ -61,6 +80,67 @@ for (const backend of backends) {
     after(() => {
       cleanupTestEnv(env);
       restoreBackend(prevMux);
+    });
+
+    it("executes long commands in hidden cmux workspaces", async (t) => {
+      if (backend !== "cmux") {
+        t.skip("cmux-specific lazy terminal initialization regression");
+        return;
+      }
+
+      const initial = cmuxIdentify();
+      const callerWorkspace = initial.caller?.workspace_ref;
+      const originalFocusedWorkspace = initial.focused?.workspace_ref;
+
+      if (!callerWorkspace || !originalFocusedWorkspace) {
+        t.skip("cmux identify did not report caller/focused workspaces");
+        return;
+      }
+
+      const awayWorkspace = cmuxWorkspaceRefs().find((workspace) => workspace !== callerWorkspace);
+      if (!awayWorkspace) {
+        t.skip("requires at least two cmux workspaces");
+        return;
+      }
+
+      const shouldRestoreFocus = originalFocusedWorkspace === callerWorkspace;
+      if (shouldRestoreFocus) {
+        cmuxSelectWorkspace(awayWorkspace);
+        await sleep(500);
+      }
+
+      const hidden = cmuxIdentify();
+      assert.notEqual(
+        hidden.focused?.workspace_ref,
+        callerWorkspace,
+        "test setup should leave the caller workspace hidden",
+      );
+
+      const surface = createTrackedSurface(env, "hidden-long-cmd-test");
+
+      try {
+        const marker = `HIDDEN_LONG_${uniqueId()}`;
+
+        // Match the subagent launch sequence: create a surface, wait for shell
+        // readiness, then send a script-backed command. Without the cmux wake
+        // workaround, hidden surfaces can render the `bash <script>` text before
+        // shell startup and never evaluate it.
+        await sleep(2500);
+        sendLongCommand(surface, `echo ${marker}`);
+
+        await waitForScreen(surface, new RegExp(`^${marker}$`, "m"), 10_000, 100);
+      } finally {
+        try {
+          closeSurface(surface);
+        } catch {}
+        untrackSurface(env, surface);
+
+        if (shouldRestoreFocus) {
+          try {
+            cmuxSelectWorkspace(originalFocusedWorkspace);
+          } catch {}
+        }
+      }
     });
 
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
