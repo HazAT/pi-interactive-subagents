@@ -137,6 +137,9 @@ interface AgentDefaults {
   skills?: string;
   thinking?: string;
   denyTools?: string;
+  claudePermissionMode?: string;
+  claudeAllowedTools?: string;
+  claudeDisallowedTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
@@ -242,6 +245,16 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
+    claudePermissionMode:
+      getFrontmatterValue(frontmatter, "claude-permission-mode") ??
+      getFrontmatterValue(frontmatter, "permission-mode"),
+    claudeAllowedTools:
+      getFrontmatterValue(frontmatter, "claude-tools") ??
+      getFrontmatterValue(frontmatter, "allowed-tools") ??
+      getFrontmatterValue(frontmatter, "tools"),
+    claudeDisallowedTools:
+      getFrontmatterValue(frontmatter, "claude-disallowed-tools") ??
+      getFrontmatterValue(frontmatter, "disallowed-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
@@ -686,6 +699,29 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   return [...allow].join(",");
 }
 
+function buildClaudePermissionArgs(agentDefs: AgentDefaults | null): string[] {
+  const args: string[] = [];
+  const permissionMode = agentDefs?.claudePermissionMode?.trim();
+
+  if (permissionMode) {
+    args.push("--permission-mode", shellEscape(permissionMode));
+  } else {
+    args.push("--dangerously-skip-permissions");
+  }
+
+  const allowedTools = agentDefs?.claudeAllowedTools?.trim();
+  if (allowedTools) {
+    args.push("--tools", shellEscape(allowedTools));
+  }
+
+  const disallowedTools = agentDefs?.claudeDisallowedTools?.trim();
+  if (disallowedTools) {
+    args.push("--disallowed-tools", shellEscape(disallowedTools));
+  }
+
+  return args;
+}
+
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
@@ -902,6 +938,7 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
+  buildClaudePermissionArgs,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1014,7 +1051,7 @@ async function launchSubagent(
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
     cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
+    cmdParts.push(...buildClaudePermissionArgs(agentDefs));
 
     if (existsSync(pluginDir)) {
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));

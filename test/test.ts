@@ -884,6 +884,28 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads Claude Code permission and tool overrides from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "claude-readonly-test-agent",
+        [
+          "name: claude-readonly-test-agent",
+          "cli: claude",
+          "permission-mode: default",
+          "tools: Read,Grep,Glob",
+          "disallowed-tools: Bash,Edit,Write",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("claude-readonly-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.claudePermissionMode, "default");
+      assert.equal(loaded.claudeAllowedTools, "Read,Grep,Glob");
+      assert.equal(loaded.claudeDisallowedTools, "Bash,Edit,Write");
+    });
+  });
+
   it("loads explicit interactive flag from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1089,6 +1111,29 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  });
+
+  it("buildClaudePermissionArgs keeps legacy bypass permissions by default", () => {
+    assert.deepEqual(testApi.buildClaudePermissionArgs(null), ["--dangerously-skip-permissions"]);
+    assert.deepEqual(testApi.buildClaudePermissionArgs({}), ["--dangerously-skip-permissions"]);
+  });
+
+  it("buildClaudePermissionArgs supports read-only Claude Code overrides", () => {
+    assert.deepEqual(
+      testApi.buildClaudePermissionArgs({
+        claudePermissionMode: "default",
+        claudeAllowedTools: "Read,Grep,Glob",
+        claudeDisallowedTools: "Bash,Edit,Write",
+      }),
+      [
+        "--permission-mode",
+        "'default'",
+        "--tools",
+        "'Read,Grep,Glob'",
+        "--disallowed-tools",
+        "'Bash,Edit,Write'",
+      ],
+    );
   });
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
