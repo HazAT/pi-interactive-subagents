@@ -35,6 +35,7 @@ Supported multiplexers:
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
+- [kitty](https://sw.kovidgoyal.net/kitty/) (terminal emulator with remote control API)
 
 Start pi inside one of them:
 
@@ -46,9 +47,11 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm — no wrapper needed
+# or
+# just run pi inside kitty — no wrapper needed
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|kitty` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -88,6 +91,39 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 | **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
+
+---
+
+## kitty Backend
+
+kitty subagent surfaces use the `kitten @` remote control API. Two surface modes are available:
+
+- **`window`** (default) — split window inside the current tab, auto-balanced side-by-side via `horizontal` layout
+- **`tab`** — new dedicated tab with full terminal space
+
+Select the mode via agent frontmatter:
+
+```yaml
+---
+name: my-agent
+kitty-mode: tab
+---
+```
+
+Resolution order: agent frontmatter `kitty-mode` → default (`"window"`).
+
+### kitty.conf Requirements
+
+Add these lines to `~/.config/kitty/kitty.conf`:
+
+```kittyconf
+allow_remote_control socket-only
+listen_on unix:/tmp/kitty-rc
+```
+
+Just run `pi` inside kitty — no wrapper needed.
+
+The backend uses socket-based remote control (`KITTY_LISTEN_ON`) for TUI compatibility — DCS sequences via `/dev/tty` are not used.
 
 ---
 
@@ -306,6 +342,7 @@ You are a specialized agent that does X...
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+| `kitty-mode`    | string  | Surface mode for kitty backend: `window` (split window, default) or `tab` (dedicated tab)                                                                                                   |
 
 ---
 
@@ -472,6 +509,7 @@ Every sub-agent session displays a compact tools widget showing available and de
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
+  - [kitty](https://sw.kovidgoyal.net/kitty/)
 
 ```bash
 cmux pi
@@ -481,13 +519,26 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm
+# or
+# just run pi inside kitty — no wrapper needed
 ```
 
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm, kitty
 ```
+
+### kitty configuration
+
+kitty requires remote control to be enabled in `~/.config/kitty/kitty.conf`:
+
+```kittyconf
+allow_remote_control socket-only
+listen_on unix:/tmp/kitty-rc
+```
+
+Agent frontmatter supports `kitty-mode: tab` or `kitty-mode: window` to control surface mode (default: `window`).
 
 ---
 

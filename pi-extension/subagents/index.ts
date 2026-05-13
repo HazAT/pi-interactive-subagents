@@ -142,6 +142,7 @@ interface AgentDefaults {
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
+  kittyMode?: "tab" | "window";
   cwd?: string;
   cli?: string;
   body?: string;
@@ -220,6 +221,11 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
   return undefined;
 }
 
+function parseKittyMode(value: string | undefined): "tab" | "window" | undefined {
+  if (value === "tab" || value === "window") return value;
+  return undefined;
+}
+
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
@@ -246,6 +252,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
+    kittyMode: parseKittyMode(getFrontmatterValue(frontmatter, "kitty-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
     body: body || undefined,
@@ -354,6 +361,18 @@ function resolveEffectiveInteractive(
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
+}
+
+/**
+ * Resolve the effective kitty surface mode from agent frontmatter.
+ * Only used when the mux backend is "kitty".
+ */
+function resolveEffectiveKittyMode(
+  agentDefs: AgentDefaults | null,
+): "tab" | "window" {
+  const agentMode = agentDefs?.kittyMode;
+  if (agentMode === "tab" || agentMode === "window") return agentMode;
+  return "window";
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -969,7 +988,8 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const kittyMode = resolveEffectiveKittyMode(agentDefs);
+  const surface = options?.surface ?? createSurface(params.name, kittyMode);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1793,7 +1813,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSurface(name);
+        const surface = createSurface(name, "window");
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
