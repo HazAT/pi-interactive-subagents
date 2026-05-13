@@ -1007,6 +1007,128 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("applies settings.json model/thinking overrides to bundled agents", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeFileSync(
+        join(globalDir, "settings.json"),
+        JSON.stringify({
+          subagents: {
+            agentOverrides: {
+              worker: { model: "anthropic/override-worker", thinking: "high" },
+            },
+          },
+        }),
+      );
+
+      const defs = testApi.loadAgentDefaults("worker");
+      assert.ok(defs, "expected bundled worker to be discoverable");
+      assert.equal(defs.model, "anthropic/override-worker");
+      assert.equal(defs.thinking, "high");
+
+      const listed = testApi.discoverAgentDefinitions().find((agent: any) => agent.name === "worker");
+      assert.equal(listed?.model, "anthropic/override-worker");
+      assert.equal(listed?.thinking, "high");
+    });
+  });
+
+  it("lets project settings.json override user settings per model/thinking field", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir, projectDir }) => {
+      writeFileSync(
+        join(globalDir, "settings.json"),
+        JSON.stringify({
+          subagents: {
+            agentOverrides: {
+              worker: { model: "anthropic/user-worker", thinking: "low" },
+            },
+          },
+        }),
+      );
+      writeFileSync(
+        join(projectDir, ".pi", "settings.json"),
+        JSON.stringify({
+          subagents: {
+            agentOverrides: {
+              worker: { thinking: "xhigh" },
+            },
+          },
+        }),
+      );
+
+      const defs = testApi.loadAgentDefaults("worker");
+      assert.ok(defs, "expected bundled worker to be discoverable");
+      assert.equal(defs.model, "anthropic/user-worker");
+      assert.equal(defs.thinking, "xhigh");
+    });
+  });
+
+  it("does not apply built-in settings.json overrides to project agents", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalDir }) => {
+      writeFileSync(
+        join(globalDir, "settings.json"),
+        JSON.stringify({
+          subagents: {
+            agentOverrides: {
+              worker: { model: "anthropic/override-worker", thinking: "high" },
+            },
+          },
+        }),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "worker",
+        [
+          "name: worker",
+          "description: Project worker",
+          "model: anthropic/project-worker",
+          "thinking: low",
+        ].join("\n"),
+      );
+
+      const defs = testApi.loadAgentDefaults("worker");
+      assert.ok(defs, "expected project worker to load");
+      assert.equal(defs.model, "anthropic/project-worker");
+      assert.equal(defs.thinking, "low");
+    });
+  });
+
+  it("applies settings.json tools override to bundled agents", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeFileSync(
+        join(globalDir, "settings.json"),
+        JSON.stringify({
+          subagents: {
+            agentOverrides: {
+              scout: { tools: "read, bash, grep, find, ls" },
+            },
+          },
+        }),
+      );
+
+      const defs = testApi.loadAgentDefaults("scout");
+      assert.ok(defs, "expected bundled scout to be discoverable");
+      assert.equal(defs.tools, "read, bash, grep, find, ls");
+    });
+  });
+
+  it("supports tools: false to clear bundled agent tools", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeFileSync(
+        join(globalDir, "settings.json"),
+        JSON.stringify({
+          subagents: {
+            agentOverrides: {
+              worker: { tools: false },
+            },
+          },
+        }),
+      );
+
+      const defs = testApi.loadAgentDefaults("worker");
+      assert.ok(defs, "expected bundled worker to be discoverable");
+      assert.equal(defs.tools, undefined);
+    });
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
