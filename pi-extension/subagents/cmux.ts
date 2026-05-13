@@ -1217,7 +1217,7 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ping" | "sentinel" | "error" | "quit";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
@@ -1245,6 +1245,9 @@ function interpretExitSidecar(data: any): PollResult {
         ? data.errorMessage
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
+  }
+  if (data?.type === "quit") {
+    return { reason: "quit", exitCode: 0 };
   }
   return { reason: "done", exitCode: 0 };
 }

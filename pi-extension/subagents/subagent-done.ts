@@ -42,6 +42,31 @@ export interface SubagentErrorInfo {
   stopReason: "error";
 }
 
+type ChildExitSidecarPayload =
+  | { type: "done" }
+  | { type: "ping"; name: string; message: string }
+  | { type: "error"; errorMessage: string; stopReason: "error" }
+  | { type: "quit" };
+
+export type ExitSidecarWriteResult = "written" | "exists" | "missing-session" | "write-error";
+
+export function writeExitSidecarIfAbsent(
+  sessionFile: string | undefined,
+  payload: ChildExitSidecarPayload,
+): ExitSidecarWriteResult {
+  if (!sessionFile) return "missing-session";
+  const exitFile = `${sessionFile}.exit`;
+  try {
+    writeFileSync(exitFile, JSON.stringify(payload), { flag: "wx" });
+    return "written";
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+    return code === "EEXIST" ? "exists" : "write-error";
+  }
+}
+
 /**
  * If the last assistant message in the turn ended with `stopReason: "error"`
  * (typically auto-retry exhausted on an overload / rate limit / server error),
@@ -143,6 +168,18 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let exitSidecarClaimed = false;
+
+  function claimExitSidecar(
+    sessionFile: string | undefined,
+    payload: ChildExitSidecarPayload,
+  ): ExitSidecarWriteResult {
+    const result = writeExitSidecarIfAbsent(sessionFile, payload);
+    if (result === "written" || result === "exists") {
+      exitSidecarClaimed = true;
+    }
+    return result;
+  }
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -183,20 +220,14 @@ export default function (pi: ExtensionAPI) {
       // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
+      if (errorInfo) {
+        claimExitSidecar(sessionFile, {
+          type: "error",
+          errorMessage: errorInfo.errorMessage,
+          stopReason: errorInfo.stopReason,
+        });
+      } else {
+        claimExitSidecar(sessionFile, { type: "done" });
       }
 
       recorder.agentEndDone();
@@ -253,7 +284,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
-    recorder.sessionShutdown((event as any).reason);
+    const reason = (event as any).reason;
+    recorder.sessionShutdown(reason);
+
+    if (reason === "quit" && !exitSidecarClaimed) {
+      claimExitSidecar(process.env.PI_SUBAGENT_SESSION, { type: "quit" });
+    }
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -290,7 +326,7 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      claimExitSidecar(sessionFile, exitData);
 
       ctx.shutdown();
       return {
@@ -311,9 +347,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-      }
+      claimExitSidecar(sessionFile, { type: "done" });
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
