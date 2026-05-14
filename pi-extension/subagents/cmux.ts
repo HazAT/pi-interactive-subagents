@@ -6,7 +6,8 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "kitty";
+export type KittySurfaceMode = "tab" | "window";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,7 +44,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm" || pref === "kitty") return pref;
   return null;
 }
 
@@ -79,17 +80,42 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+function isKittyRuntimeAvailable(): boolean {
+  if (!process.env.KITTY_PID || !process.env.KITTY_WINDOW_ID) return false;
+  if (!hasCommand("kitten")) return false;
+  // Verify remote control works — prefer KITTY_LISTEN_ON socket (works from TUI)
+  // fall back to controlling terminal (works from kitty window, may fail in TUI)
+  try {
+    const args: string[] = ["@", "ls"];
+    if (process.env.KITTY_LISTEN_ON) {
+      args.splice(1, 0, "--to", process.env.KITTY_LISTEN_ON);
+    }
+    const rc = spawnSync("kitten", args, {
+      encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"],
+    });
+    return rc.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+export function isKittyAvailable(): boolean {
+  return isKittyRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "kitty") return isKittyRuntimeAvailable() ? "kitty" : null;
 
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isKittyRuntimeAvailable()) return "kitty";
   return null;
 }
 
@@ -111,7 +137,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "kitty") {
+    return "Start pi inside kitty with `allow_remote_control=yes` in kitty.conf (or `listen_on unix:/tmp/kitty-rc` for socket mode).";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or kitty (with `allow_remote_control=yes` in kitty.conf).";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -120,6 +149,192 @@ function requireMuxBackend(): MuxBackend {
     throw new Error(`No supported terminal multiplexer found. ${muxSetupHint()}`);
   }
   return backend;
+}
+
+// ─── Kitty helpers ───
+
+/** Pi's own kitty window ID — captured at startup, used to target splits regardless of user focus. */
+const kittyParentWindowId = process.env.KITTY_WINDOW_ID ?? null;
+
+/** Build `kitten @` base args with `--to` socket if available. */
+function kittyBaseArgs(): string[] {
+  const args: string[] = ["@"];
+  if (process.env.KITTY_LISTEN_ON) {
+    args.push("--to", process.env.KITTY_LISTEN_ON);
+  }
+  return args;
+}
+
+/** Parse surface `"kitty:N"` → window ID `"N"`. */
+function kittyWindowId(surface: string): string {
+  return surface.startsWith("kitty:") ? surface.slice(6) : surface;
+}
+
+/** Run a `kitten @` command synchronously, throw on failure. */
+function kittyExec(args: string[]): void {
+  const rc = spawnSync("kitten", args, { encoding: "utf8", timeout: 10000 });
+  if (rc.error || rc.status !== 0) {
+    throw new Error(`kitten ${args.join(" ")} failed: ${rc.stderr?.trim() || rc.stdout?.trim()}`);
+  }
+}
+
+/** Run a `kitten @` command and return stdout, throw on failure. */
+function kittyExecOutput(args: string[]): string {
+  const rc = spawnSync("kitten", args, { encoding: "utf8", timeout: 10000 });
+  if (rc.error || rc.status !== 0) {
+    throw new Error(`kitten ${args.join(" ")} failed: ${rc.stderr?.trim() || rc.stdout?.trim()}`);
+  }
+  return rc.stdout;
+}
+
+
+/**
+ * Check whether the currently focused tab is the one containing pi's window.
+ * Parses `kitten @ ls` to find which tab the focused window belongs to,
+ * then checks if that's the same tab as pi's parent window.
+ */
+function kittyIsParentFocused(): boolean {
+  if (!kittyParentWindowId) return true;
+  try {
+    const lsOutput = kittyExecOutput([...kittyBaseArgs(), "ls"]);
+    const parsed = JSON.parse(lsOutput);
+    const parentWindowId = Number(kittyParentWindowId);
+
+    // Build a map: windowId → tabId
+    const windowToTab = new Map<number, number>();
+    // Also track the OS window's active (focused) window ID
+    let focusedWindowId: number | undefined;
+
+    if (Array.isArray(parsed)) {
+      for (const osWindow of parsed) {
+        const activeId = (osWindow as any).active;
+        if (typeof activeId === "number") {
+          focusedWindowId = activeId;
+        }
+        const tabs = (osWindow as any).tabs;
+        if (Array.isArray(tabs)) {
+          for (const tab of tabs) {
+            const tabId = (tab as any).id;
+            const tabWindows = (tab as any).windows;
+            if (Array.isArray(tabWindows)) {
+              for (const w of tabWindows) {
+                const wid = (w as any).id;
+                if (typeof wid === "number") {
+                  windowToTab.set(wid, tabId);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Find the tab containing pi's window
+    const parentTabId = windowToTab.get(parentWindowId);
+    if (parentTabId == null) return true; // pi's window not found — safe default
+
+    // Find the tab containing the focused window
+    if (focusedWindowId == null) return true;
+    const focusedTabId = windowToTab.get(focusedWindowId);
+    if (focusedTabId == null) return true;
+
+    return focusedTabId === parentTabId;
+  } catch {
+    // ls parse failure — assume focused (safe default)
+  }
+  return true;
+}
+
+/** Rebalance windows in pi's tab: switch to horizontal layout.
+ * Only rebalance when pi's tab is the currently active one — no point
+ * rearranging a tab the user isn't looking at. */
+function kittyRebalance(): void {
+  if (!kittyIsParentFocused()) return;
+  try {
+    kittyExec([...kittyBaseArgs(), "goto-layout", "horizontal"]);
+  } catch {
+    // Layout switch is best-effort — ignore failures.
+  }
+}
+
+
+/** Create a new kitty window inside pi's tab (split mode).
+ * Launches in a temporary tab, then detaches the window into pi's tab.
+ * This avoids stealing focus from whatever tab the user is working in. */
+function createKittySurfaceWindow(name: string): string {
+  // Step 1: Launch in a new tab — with --keep-focus, doesn't steal focus from user's tab.
+  const launchArgs = [...kittyBaseArgs(), "launch", "--type=tab", "--keep-focus"];
+  launchArgs.push("--title", name, "--cwd", "current");
+  const windowId = kittyExecOutput(launchArgs).trim();
+  if (!/^\d+$/.test(windowId)) {
+    throw new Error(`Unexpected kitty launch output: ${windowId}`);
+  }
+
+  // Step 2: Detach the new window into pi's tab.
+  // --target-tab window_id:<N> matches the tab containing pi's window.
+  // --stay-in-tab keeps focus on the user's currently focused tab.
+  // The source tab (now empty) is auto-closed by kitty.
+  if (kittyParentWindowId) {
+    try {
+      kittyExec([...kittyBaseArgs(), "detach-window", "--match", `id:${windowId}`,
+        "--target-tab", `window_id:${kittyParentWindowId}`, "--stay-in-tab"]);
+    } catch {
+      // Pi's tab may have been closed — window stays in its temp tab, still usable
+    }
+  }
+
+  kittyRebalance();
+  return `kitty:${windowId}`;
+}
+
+/** Create a new kitty tab (tab mode). */
+function createKittySurfaceTab(name: string): string {
+  const args = [...kittyBaseArgs(), "launch", "--type=tab", "--keep-focus"];
+  args.push("--title", name, "--cwd", "current");
+  const windowId = kittyExecOutput(args).trim();
+  if (!/^\d+$/.test(windowId)) {
+    throw new Error(`Unexpected kitty launch output: ${windowId}`);
+  }
+  return `kitty:${windowId}`;
+}
+
+/** Send text to a kitty window. */
+function kittySendCommand(surface: string, command: string): void {
+  const windowId = kittyWindowId(surface);
+  const args = [...kittyBaseArgs(), "send-text", "--match", `id:${windowId}`];
+  args.push(command);
+  kittyExec(args);
+}
+
+/** Send Escape key to a kitty window. */
+function kittySendEscape(surface: string): void {
+  const windowId = kittyWindowId(surface);
+  const args = [...kittyBaseArgs(), "action", "--match", `id:${windowId}`];
+  args.push("send_key Escape");
+  kittyExec(args);
+}
+
+/** Read screen text from a kitty window. */
+function kittyReadScreenImpl(surface: string, lines: number): string {
+  const windowId = kittyWindowId(surface);
+  const args = [...kittyBaseArgs(), "get-text", "--match", `id:${windowId}`];
+  const output = kittyExecOutput(args);
+  return tailLines(output, lines);
+}
+
+/** Close a kitty window. */
+function kittyCloseSurface(surface: string): void {
+  const windowId = kittyWindowId(surface);
+  const args = [...kittyBaseArgs(), "close-window", "--match", `id:${windowId}`];
+  kittyExec(args);
+  kittyRebalance();
+}
+
+/** Rename the current kitty window title. */
+function kittyRenameTab(title: string): void {
+  const windowId = process.env.KITTY_WINDOW_ID!;
+  const args = [...kittyBaseArgs(), "set-window-title", "--match", `id:${windowId}`, title];
+  kittyExec(args);
 }
 
 /**
@@ -748,10 +963,11 @@ function createCmuxSplitSurface(
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For tmux/wezterm: falls back to split behavior.
+ * For kitty: creates a window split (default) or a new tab (mode="tab").
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `kitty:N` in kitty).
  */
-export function createSurface(name: string): string {
+export function createSurface(name: string, mode?: KittySurfaceMode): string {
   const backend = getMuxBackend();
 
   if (backend === "cmux" && cmuxSubagentPane) {
@@ -774,6 +990,13 @@ export function createSurface(name: string): string {
 
   if (backend === "zellij") {
     return createZellijSurface(name);
+  }
+
+  if (backend === "kitty") {
+    if (mode === "tab") {
+      return createKittySurfaceTab(name);
+    }
+    return createKittySurfaceWindow(name);
   }
 
   // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
@@ -870,6 +1093,11 @@ export function createSurfaceSplit(
     return paneId;
   }
 
+  if (backend === "kitty") {
+    // Kitty always uses hsplit for window mode — direction is informational only.
+    return createKittySurfaceWindow(name);
+  }
+
   // zellij
   const directionArg = direction === "left" || direction === "right" ? "right" : "down";
   const args = ["new-pane", "--direction", directionArg, "--name", name, "--cwd", process.cwd()];
@@ -941,14 +1169,22 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
-  // zellij: rename the agent's own pane, not the whole tab. In multi-pane layouts,
-  // rename-tab clobbers the user's tab title whenever a subagent starts or /plan runs.
-  // Closes #21.
-  const paneId = process.env.ZELLIJ_PANE_ID;
-  if (paneId) {
-    zellijActionSync(["rename-pane", title], `pane:${paneId}`);
-  } else {
-    zellijActionSync(["rename-pane", title]);
+  if (backend === "zellij") {
+    // rename the agent's own pane, not the whole tab. In multi-pane layouts,
+    // rename-tab clobbers the user's tab title whenever a subagent starts or /plan runs.
+    // Closes #21.
+    const paneId = process.env.ZELLIJ_PANE_ID;
+    if (paneId) {
+      zellijActionSync(["rename-pane", title], `pane:${paneId}`);
+    } else {
+      zellijActionSync(["rename-pane", title]);
+    }
+    return;
+  }
+
+  if (backend === "kitty") {
+    kittyRenameTab(title);
+    return;
   }
 }
 
@@ -1003,6 +1239,11 @@ export function renameWorkspace(title: string): void {
   // Additionally, pi titles often contain special characters (em dashes,
   // spaces) that fail zellij's session name validation on lookup.
   // rename-tab (called separately) is sufficient for user-visible naming.
+
+  if (backend === "kitty") {
+    // Kitty doesn't have a workspace concept — no-op
+    return;
+  }
 }
 
 /**
@@ -1033,6 +1274,11 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "kitty") {
+    kittySendCommand(surface, command + "\n");
+    return;
+  }
+
   zellijActionSync(["write-chars", command], surface);
   zellijActionSync(["write", "13"], surface);
 }
@@ -1057,6 +1303,11 @@ export function sendEscape(surface: string): void {
     execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", "\u001b"], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "kitty") {
+    kittySendEscape(surface);
     return;
   }
 
@@ -1132,6 +1383,10 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
+  if (backend === "kitty") {
+    return kittyReadScreenImpl(surface, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
   // and --path may silently fail to create the file. Stdout capture is robust.
@@ -1177,6 +1432,10 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return tailLines(stdout, lines);
   }
 
+  if (backend === "kitty") {
+    return kittyReadScreenImpl(surface, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
   const { stdout } = await execFileAsync(
@@ -1209,6 +1468,11 @@ export function closeSurface(surface: string): void {
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "kitty") {
+    kittyCloseSurface(surface);
     return;
   }
 
