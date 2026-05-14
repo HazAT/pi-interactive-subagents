@@ -153,6 +153,9 @@ function requireMuxBackend(): MuxBackend {
 
 // ─── Kitty helpers ───
 
+/** Pi's own kitty window ID — captured at startup, used to target splits regardless of user focus. */
+const kittyParentWindowId = process.env.KITTY_WINDOW_ID ?? null;
+
 /** Build `kitten @` base args with `--to` socket if available. */
 function kittyBaseArgs(): string[] {
   const args: string[] = ["@"];
@@ -184,9 +187,69 @@ function kittyExecOutput(args: string[]): string {
   return rc.stdout;
 }
 
-/** Rebalance windows in the current tab: switch to horizontal layout.
- * Horizontal places windows side-by-side with equal widths, auto-adjusts on add/remove. */
+
+/**
+ * Check whether the currently focused tab is the one containing pi's window.
+ * Parses `kitten @ ls` to find which tab the focused window belongs to,
+ * then checks if that's the same tab as pi's parent window.
+ */
+function kittyIsParentFocused(): boolean {
+  if (!kittyParentWindowId) return true;
+  try {
+    const lsOutput = kittyExecOutput([...kittyBaseArgs(), "ls"]);
+    const parsed = JSON.parse(lsOutput);
+    const parentWindowId = Number(kittyParentWindowId);
+
+    // Build a map: windowId → tabId
+    const windowToTab = new Map<number, number>();
+    // Also track the OS window's active (focused) window ID
+    let focusedWindowId: number | undefined;
+
+    if (Array.isArray(parsed)) {
+      for (const osWindow of parsed) {
+        const activeId = (osWindow as any).active;
+        if (typeof activeId === "number") {
+          focusedWindowId = activeId;
+        }
+        const tabs = (osWindow as any).tabs;
+        if (Array.isArray(tabs)) {
+          for (const tab of tabs) {
+            const tabId = (tab as any).id;
+            const tabWindows = (tab as any).windows;
+            if (Array.isArray(tabWindows)) {
+              for (const w of tabWindows) {
+                const wid = (w as any).id;
+                if (typeof wid === "number") {
+                  windowToTab.set(wid, tabId);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Find the tab containing pi's window
+    const parentTabId = windowToTab.get(parentWindowId);
+    if (parentTabId == null) return true; // pi's window not found — safe default
+
+    // Find the tab containing the focused window
+    if (focusedWindowId == null) return true;
+    const focusedTabId = windowToTab.get(focusedWindowId);
+    if (focusedTabId == null) return true;
+
+    return focusedTabId === parentTabId;
+  } catch {
+    // ls parse failure — assume focused (safe default)
+  }
+  return true;
+}
+
+/** Rebalance windows in pi's tab: switch to horizontal layout.
+ * Only rebalance when pi's tab is the currently active one — no point
+ * rearranging a tab the user isn't looking at. */
 function kittyRebalance(): void {
+  if (!kittyIsParentFocused()) return;
   try {
     kittyExec([...kittyBaseArgs(), "goto-layout", "horizontal"]);
   } catch {
@@ -194,14 +257,32 @@ function kittyRebalance(): void {
   }
 }
 
-/** Create a new kitty window inside the current tab (split mode). */
+
+/** Create a new kitty window inside pi's tab (split mode).
+ * Launches in a temporary tab, then detaches the window into pi's tab.
+ * This avoids stealing focus from whatever tab the user is working in. */
 function createKittySurfaceWindow(name: string): string {
-  const args = [...kittyBaseArgs(), "launch", "--type=window", "--location", "vsplit", "--keep-focus"];
-  args.push("--title", name, "--cwd", "current");
-  const windowId = kittyExecOutput(args).trim();
+  // Step 1: Launch in a new tab — with --keep-focus, doesn't steal focus from user's tab.
+  const launchArgs = [...kittyBaseArgs(), "launch", "--type=tab", "--keep-focus"];
+  launchArgs.push("--title", name, "--cwd", "current");
+  const windowId = kittyExecOutput(launchArgs).trim();
   if (!/^\d+$/.test(windowId)) {
     throw new Error(`Unexpected kitty launch output: ${windowId}`);
   }
+
+  // Step 2: Detach the new window into pi's tab.
+  // --target-tab window_id:<N> matches the tab containing pi's window.
+  // --stay-in-tab keeps focus on the user's currently focused tab.
+  // The source tab (now empty) is auto-closed by kitty.
+  if (kittyParentWindowId) {
+    try {
+      kittyExec([...kittyBaseArgs(), "detach-window", "--match", `id:${windowId}`,
+        "--target-tab", `window_id:${kittyParentWindowId}`, "--stay-in-tab"]);
+    } catch {
+      // Pi's tab may have been closed — window stays in its temp tab, still usable
+    }
+  }
+
   kittyRebalance();
   return `kitty:${windowId}`;
 }
