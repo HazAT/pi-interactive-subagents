@@ -20,6 +20,7 @@ import {
   createSurface,
   sendLongCommand,
   pollForExit,
+  type PollResult,
   closeSurface,
   getMuxBackend,
   sendEscape,
@@ -439,13 +440,20 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "exitReason"
   >,
   name: string,
 ): string {
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
+
+  if (result.exitReason === "quit") {
+    return (
+      `Sub-agent "${name}" closed by user (${formatElapsed(result.elapsed)}).\n\n` +
+      `${result.summary}${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -478,6 +486,7 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  exitReason?: PollResult["reason"];
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
@@ -892,6 +901,20 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function resolveResumeSummary(
+  entries: any[],
+  result: Pick<SubagentResult, "errorMessage" | "exitCode" | "exitReason">,
+): string {
+  return findLastAssistantMessage(entries) ??
+    (result.errorMessage
+      ? `Subagent error: ${result.errorMessage}`
+      : result.exitReason === "quit"
+        ? "Sub-agent session was closed by the user before it called subagent_done."
+        : result.exitCode !== 0
+          ? `Resumed session exited with code ${result.exitCode}`
+          : "Resumed session exited without new output");
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -911,6 +934,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  resolveResumeSummary,
   runningSubagents,
   formatElapsed,
 };
@@ -1294,7 +1318,15 @@ async function watchSubagent(
       closeSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        exitReason: result.reason,
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1305,15 +1337,19 @@ async function watchSubagent(
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
+          : result.reason === "quit"
+            ? "Sub-agent session was closed by the user before it called subagent_done."
+            : result.exitCode !== 0
+              ? `Sub-agent exited with code ${result.exitCode}`
+              : "Sub-agent exited without output");
     } else {
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+        : result.reason === "quit"
+          ? "Sub-agent session was closed by the user before it called subagent_done."
+          : result.exitCode !== 0
+            ? `Sub-agent exited with code ${result.exitCode}`
+            : "Sub-agent exited without output";
     }
 
     closeSurface(surface);
@@ -1326,6 +1362,7 @@ async function watchSubagent(
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
+      exitReason: result.reason,
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
@@ -1496,6 +1533,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   agent: running.agent,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
+                  exitReason: result.exitReason,
                   sessionFile: result.sessionFile,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
@@ -1909,12 +1947,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
+            const summary = resolveResumeSummary(allEntries, result);
             const presentation = resolveResultPresentation(
               { ...result, summary, sessionFile: params.sessionPath },
               name,
@@ -1930,6 +1963,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   task: params.message ?? "resumed session",
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
+                  exitReason: result.exitReason,
                   sessionFile: params.sessionPath,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                 },
@@ -2015,7 +2049,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
         const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
+        const exitReason = details.exitReason;
+        const closedByUser = exitReason === "quit";
+        const failed = !closedByUser && (exitCode !== 0 || !!errorMessage);
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
@@ -2023,11 +2059,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const icon = failed
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
-        const status = errorMessage
-          ? "failed (provider/agent error)"
-          : failed
-            ? `failed (exit ${exitCode})`
-            : "completed";
+        const status = closedByUser
+          ? "closed by user"
+          : errorMessage
+            ? "failed (provider/agent error)"
+            : failed
+              ? `failed (exit ${exitCode})`
+              : "completed";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
         const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
@@ -2037,6 +2075,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const summary = rawContent
           .replace(/\n\nSession: .+\nResume: .+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
+          .replace(`Sub-agent "${name}" closed by user (${elapsed}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
             new RegExp(
