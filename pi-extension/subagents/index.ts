@@ -12,6 +12,9 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  chmodSync,
+  renameSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -124,7 +127,7 @@ const SubagentParams = Type.Object({
   resumeSessionId: Type.Optional(
     Type.String({
       description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
+        "Resume a previous Claude Code or Cursor Agent session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in result details when available. Use this to retry cancelled runs or ask follow-up questions.",
     }),
   ),
 });
@@ -137,6 +140,13 @@ interface AgentDefaults {
   skills?: string;
   thinking?: string;
   denyTools?: string;
+  claudePermissionMode?: string;
+  claudeAllowedTools?: string;
+  claudeDisallowedTools?: string;
+  cursorForce?: boolean;
+  cursorYolo?: boolean;
+  cursorMode?: string;
+  cursorSandbox?: string;
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
@@ -242,6 +252,20 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
+    claudePermissionMode:
+      getFrontmatterValue(frontmatter, "claude-permission-mode") ??
+      getFrontmatterValue(frontmatter, "permission-mode"),
+    claudeAllowedTools:
+      getFrontmatterValue(frontmatter, "claude-tools") ??
+      getFrontmatterValue(frontmatter, "allowed-tools") ??
+      getFrontmatterValue(frontmatter, "tools"),
+    claudeDisallowedTools:
+      getFrontmatterValue(frontmatter, "claude-disallowed-tools") ??
+      getFrontmatterValue(frontmatter, "disallowed-tools"),
+    cursorForce: parseOptionalBoolean(getFrontmatterValue(frontmatter, "cursor-force")),
+    cursorYolo: parseOptionalBoolean(getFrontmatterValue(frontmatter, "cursor-yolo")),
+    cursorMode: getFrontmatterValue(frontmatter, "cursor-mode"),
+    cursorSandbox: getFrontmatterValue(frontmatter, "cursor-sandbox"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
@@ -475,6 +499,7 @@ interface SubagentResult {
   summary: string;
   sessionFile?: string;
   claudeSessionId?: string;
+  cursorSessionId?: string;
   exitCode: number;
   elapsed: number;
   error?: string;
@@ -686,6 +711,51 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   return [...allow].join(",");
 }
 
+function buildClaudePermissionArgs(agentDefs: AgentDefaults | null): string[] {
+  const args: string[] = [];
+  const permissionMode = agentDefs?.claudePermissionMode?.trim();
+
+  if (permissionMode) {
+    args.push("--permission-mode", shellEscape(permissionMode));
+  } else {
+    args.push("--dangerously-skip-permissions");
+  }
+
+  const allowedTools = agentDefs?.claudeAllowedTools?.trim();
+  if (allowedTools) {
+    args.push("--tools", shellEscape(allowedTools));
+  }
+
+  const disallowedTools = agentDefs?.claudeDisallowedTools?.trim();
+  if (disallowedTools) {
+    args.push("--disallowed-tools", shellEscape(disallowedTools));
+  }
+
+  return args;
+}
+
+function buildCursorPermissionArgs(agentDefs: AgentDefaults | null): string[] {
+  const args: string[] = [];
+  const mode = agentDefs?.cursorMode?.trim();
+
+  if (mode === "plan" || mode === "ask") {
+    args.push("--mode", shellEscape(mode));
+  }
+
+  if (agentDefs?.cursorYolo) {
+    args.push("--yolo");
+  } else if (agentDefs?.cursorForce === true || (!mode && agentDefs?.cursorForce !== false)) {
+    args.push("--force");
+  }
+
+  const sandbox = agentDefs?.cursorSandbox?.trim();
+  if (sandbox === "enabled" || sandbox === "disabled") {
+    args.push("--sandbox", shellEscape(sandbox));
+  }
+
+  return args;
+}
+
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
@@ -706,6 +776,177 @@ function buildPiPromptArgs(params: {
   ];
 }
 
+const CURSOR_HOOK_COMMAND = "./hooks/pi-interactive-subagents-stop.sh";
+const CURSOR_HOOK_MARKER = "pi-interactive-subagents cursor stop hook";
+const CURSOR_HOOK_STALE_MS = 12 * 60 * 60 * 1000;
+
+function getCursorConfigDir(): string {
+  return process.env.PI_CURSOR_CONFIG_DIR ?? join(homedir(), ".cursor");
+}
+
+function getCursorHookStateDir(): string {
+  return join(getAgentConfigDir(), "cursor-hook");
+}
+
+function getCursorHookPaths() {
+  const cursorDir = getCursorConfigDir();
+  const stateDir = getCursorHookStateDir();
+  return {
+    cursorDir,
+    hooksJson: join(cursorDir, "hooks.json"),
+    hookScript: join(cursorDir, "hooks", "pi-interactive-subagents-stop.sh"),
+    hookSource: join(SUBAGENTS_DIR, "cursor-hooks", "on-stop.sh"),
+    lockDir: join(stateDir, "install.lock"),
+    leasesDir: join(stateDir, "leases"),
+  };
+}
+
+type CursorHooksConfig = {
+  version?: number;
+  hooks?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+function ensureCursorHookConfig(config: CursorHooksConfig): CursorHooksConfig {
+  const next: CursorHooksConfig = { ...config };
+  next.version = typeof next.version === "number" ? next.version : 1;
+
+  const hooks = next.hooks && typeof next.hooks === "object" && !Array.isArray(next.hooks)
+    ? { ...next.hooks }
+    : {};
+  const stop = hooks.stop;
+  if (stop != null && !Array.isArray(stop)) {
+    throw new Error("Cursor hooks.json has a non-array hooks.stop field");
+  }
+
+  const stopHooks = Array.isArray(stop) ? [...stop] : [];
+  const alreadyInstalled = stopHooks.some((hook) =>
+    hook && typeof hook === "object" && (hook as { command?: unknown }).command === CURSOR_HOOK_COMMAND
+  );
+  if (!alreadyInstalled) {
+    stopHooks.push({ command: CURSOR_HOOK_COMMAND, timeout: 10 });
+  }
+
+  hooks.stop = stopHooks;
+  next.hooks = hooks;
+  return next;
+}
+
+function removeCursorHookConfig(config: CursorHooksConfig): CursorHooksConfig {
+  const hooks = config.hooks && typeof config.hooks === "object" && !Array.isArray(config.hooks)
+    ? { ...config.hooks }
+    : null;
+  if (!hooks) return config;
+
+  const stop = hooks.stop;
+  if (Array.isArray(stop)) {
+    const remaining = stop.filter((hook) =>
+      !(hook && typeof hook === "object" && (hook as { command?: unknown }).command === CURSOR_HOOK_COMMAND)
+    );
+    if (remaining.length > 0) hooks.stop = remaining;
+    else delete hooks.stop;
+  }
+
+  return { ...config, hooks };
+}
+
+function readCursorHooksConfig(hooksJson: string): CursorHooksConfig {
+  if (!existsSync(hooksJson)) return { version: 1, hooks: {} };
+  const parsed = JSON.parse(readFileSync(hooksJson, "utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Cursor hooks.json must contain a JSON object");
+  }
+  return parsed as CursorHooksConfig;
+}
+
+function writeCursorHooksConfig(hooksJson: string, config: CursorHooksConfig) {
+  mkdirSync(dirname(hooksJson), { recursive: true });
+  const tmp = `${hooksJson}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", "utf8");
+  renameSync(tmp, hooksJson);
+}
+
+function pruneCursorHookLeases(leasesDir: string, now = Date.now()) {
+  if (!existsSync(leasesDir)) return;
+  for (const entry of readdirSync(leasesDir)) {
+    if (!entry.endsWith(".json")) continue;
+    const path = join(leasesDir, entry);
+    try {
+      const lease = JSON.parse(readFileSync(path, "utf8"));
+      const startedAt = typeof lease.startedAtMs === "number" ? lease.startedAtMs : 0;
+      if (startedAt > 0 && now - startedAt < CURSOR_HOOK_STALE_MS) continue;
+    } catch {}
+    try { unlinkSync(path); } catch {}
+  }
+}
+
+function countCursorHookLeases(leasesDir: string): number {
+  if (!existsSync(leasesDir)) return 0;
+  return readdirSync(leasesDir).filter((entry) => entry.endsWith(".json")).length;
+}
+
+async function withCursorHookLock<T>(fn: () => T | Promise<T>): Promise<T> {
+  const { lockDir } = getCursorHookPaths();
+  mkdirSync(dirname(lockDir), { recursive: true });
+
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      mkdirSync(lockDir);
+      try {
+        return await fn();
+      } finally {
+        rmSync(lockDir, { recursive: true, force: true });
+      }
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  throw new Error("Timed out waiting for Cursor hook install lock");
+}
+
+async function installCursorHookForRun(id: string, sentinelFile: string) {
+  await withCursorHookLock(() => {
+    const paths = getCursorHookPaths();
+    pruneCursorHookLeases(paths.leasesDir);
+
+    mkdirSync(dirname(paths.hookScript), { recursive: true });
+    copyFileSync(paths.hookSource, paths.hookScript);
+    chmodSync(paths.hookScript, 0o755);
+
+    const config = ensureCursorHookConfig(readCursorHooksConfig(paths.hooksJson));
+    writeCursorHooksConfig(paths.hooksJson, config);
+
+    mkdirSync(paths.leasesDir, { recursive: true });
+    writeFileSync(
+      join(paths.leasesDir, `${id}.json`),
+      JSON.stringify({ id, sentinelFile, startedAtMs: Date.now() }, null, 2) + "\n",
+      "utf8",
+    );
+  });
+}
+
+async function uninstallCursorHookForRun(id: string) {
+  await withCursorHookLock(() => {
+    const paths = getCursorHookPaths();
+    try { unlinkSync(join(paths.leasesDir, `${id}.json`)); } catch {}
+    pruneCursorHookLeases(paths.leasesDir);
+    if (countCursorHookLeases(paths.leasesDir) > 0) return;
+
+    if (existsSync(paths.hooksJson)) {
+      const config = removeCursorHookConfig(readCursorHooksConfig(paths.hooksJson));
+      writeCursorHooksConfig(paths.hooksJson, config);
+    }
+
+    try {
+      if (existsSync(paths.hookScript) && readFileSync(paths.hookScript, "utf8").includes(CURSOR_HOOK_MARKER)) {
+        unlinkSync(paths.hookScript);
+      }
+    } catch {}
+  });
+}
+
 function activityLabel(activity: SubagentActivityState): string | undefined {
   if (activity.phase !== "active") return undefined;
   if (activity.activeScope === "tool") return activity.toolName ?? "tool";
@@ -715,7 +956,7 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude") return;
+  if (running.cli === "claude" || running.cli === "cursor") return;
 
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
@@ -902,7 +1143,12 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
+  buildClaudePermissionArgs,
+  buildCursorPermissionArgs,
   buildPiPromptArgs,
+  ensureCursorHookConfig,
+  removeCursorHookConfig,
+  extractCursorSummaryFromTranscriptPath,
   formatWidgetRightLabel,
   observeRunningSubagent,
   resolveDenyTools,
@@ -1014,7 +1260,7 @@ async function launchSubagent(
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
     cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
+    cmdParts.push(...buildClaudePermissionArgs(agentDefs));
 
     if (existsSync(pluginDir)) {
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));
@@ -1071,6 +1317,84 @@ async function launchSubagent(
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
+        startTimeMs: startTime,
+      }),
+    };
+
+    runningSubagents.set(id, running);
+    return running;
+  }
+
+  // ── Cursor Agent CLI path ──
+  if (agentDefs?.cli === "cursor") {
+    const sentinelFile = `/tmp/pi-cursor-${id}-done`;
+
+    try {
+      await installCursorHookForRun(id, sentinelFile);
+    } catch (error) {
+      try { closeSurface(surface); } catch {}
+      throw error;
+    }
+
+    const cmdParts: string[] = [];
+    cmdParts.push(`PI_CURSOR_SENTINEL=${shellEscape(sentinelFile)}`);
+    cmdParts.push("agent");
+    cmdParts.push(...buildCursorPermissionArgs(agentDefs));
+
+    if (effectiveModel) {
+      cmdParts.push("--model", shellEscape(effectiveModel));
+    }
+
+    if (params.resumeSessionId) {
+      cmdParts.push("--resume", shellEscape(params.resumeSessionId));
+    }
+
+    const cursorIdentity = identity ? `\n\n${identity}` : "";
+    const cursorTask = inheritsConversationContext
+      ? params.task
+      : `${cursorIdentity}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    cmdParts.push(shellEscape(cursorTask));
+
+    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+
+    const launchScriptName = `${(params.name || "subagent")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+
+    try {
+      sendLongCommand(surface, command, {
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Cursor Agent subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      });
+    } catch (error) {
+      await uninstallCursorHookForRun(id);
+      try { closeSurface(surface); } catch {}
+      throw error;
+    }
+
+    const running: RunningSubagent = {
+      id,
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      surface,
+      startTime,
+      sessionFile: subagentSessionFile,
+      launchScriptFile,
+      cli: "cursor",
+      sentinelFile,
+      interactive: effectiveInteractive,
+      statusState: createStatusState({
+        source: "cursor",
         startTimeMs: startTime,
       }),
     };
@@ -1226,21 +1550,96 @@ const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/tmp",
   ".pi", "agent", "sessions", "claude-code",
 );
+const CURSOR_SESSIONS_DIR = join(
+  process.env.HOME ?? "/tmp",
+  ".pi", "agent", "sessions", "cursor-agent",
+);
 
-function copyClaudeSession(sentinelFile: string): string | null {
+function getTranscriptPathFromSentinel(sentinelFile: string): string | null {
   try {
     const transcriptFile = sentinelFile + ".transcript";
     if (!existsSync(transcriptFile)) return null;
     const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
-    if (!transcriptPath || !existsSync(transcriptPath)) return null;
-    mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
-    const dest = join(CLAUDE_SESSIONS_DIR, filename);
+    return transcriptPath && existsSync(transcriptPath) ? transcriptPath : null;
+  } catch {
+    return null;
+  }
+}
+
+function copyTranscriptSession(sentinelFile: string, sessionsDir: string, fallbackPrefix: string): string | null {
+  try {
+    const transcriptPath = getTranscriptPathFromSentinel(sentinelFile);
+    if (!transcriptPath) return null;
+    mkdirSync(sessionsDir, { recursive: true });
+    const filename = transcriptPath.split("/").pop() ?? `${fallbackPrefix}-${Date.now()}`;
+    const dest = join(sessionsDir, filename);
     copyFileSync(transcriptPath, dest);
     return filename;
   } catch {
     return null;
   }
+}
+
+function copyClaudeSession(sentinelFile: string): string | null {
+  return copyTranscriptSession(sentinelFile, CLAUDE_SESSIONS_DIR, "claude");
+}
+
+function copyCursorSession(sentinelFile: string): string | null {
+  return copyTranscriptSession(sentinelFile, CURSOR_SESSIONS_DIR, "cursor");
+}
+
+function cursorTranscriptTextParts(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const value = (part as { text?: unknown }).text;
+      return typeof value === "string" ? value.trim() : "";
+    })
+    .filter((text) => text && text !== "[REDACTED]");
+}
+
+function extractCursorSummaryFromTranscriptPath(transcriptPath: string): string | null {
+  let lastPlan: string | null = null;
+  let lastAssistantText: string | null = null;
+
+  try {
+    for (const line of readFileSync(transcriptPath, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      const content = entry?.message?.content;
+      if (!Array.isArray(content)) continue;
+
+      if (entry?.role === "assistant") {
+        const text = cursorTranscriptTextParts(content).join("\n\n").trim();
+        if (text) lastAssistantText = text;
+      }
+
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        const tool = part as { type?: unknown; name?: unknown; input?: { plan?: unknown } };
+        if (tool.type === "tool_use" && tool.name === "CreatePlan" && typeof tool.input?.plan === "string") {
+          const plan = tool.input.plan.trim();
+          if (plan) lastPlan = plan;
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return lastPlan ?? lastAssistantText;
+}
+
+function extractCursorSummaryFromTranscript(sentinelFile: string): string | null {
+  const transcriptPath = getTranscriptPathFromSentinel(sentinelFile);
+  return transcriptPath ? extractCursorSummaryFromTranscriptPath(transcriptPath) : null;
 }
 
 async function watchSubagent(
@@ -1297,6 +1696,46 @@ async function watchSubagent(
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
+    if (running.cli === "cursor") {
+      // Cursor Agent result extraction
+      let summary = "";
+
+      if (running.sentinelFile) {
+        try {
+          summary = readFileSync(running.sentinelFile, "utf-8").trim();
+        } catch {}
+      }
+
+      if (!summary && running.sentinelFile) {
+        summary = extractCursorSummaryFromTranscript(running.sentinelFile) ?? "";
+      }
+
+      if (!summary) {
+        summary = readScreen(surface, 200)
+          .replace(/__SUBAGENT_DONE_\d+__/, "")
+          .trimEnd();
+      }
+
+      if (!summary) {
+        summary = result.exitCode !== 0
+          ? `Cursor Agent exited with code ${result.exitCode}`
+          : "Cursor Agent exited without output";
+      }
+
+      let sessionId: string | null = null;
+      if (running.sentinelFile) {
+        sessionId = copyCursorSession(running.sentinelFile);
+        try { unlinkSync(running.sentinelFile); } catch {}
+        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
+      }
+      try { await uninstallCursorHookForRun(running.id); } catch {}
+
+      closeSurface(surface);
+      runningSubagents.delete(running.id);
+
+      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { cursorSessionId: sessionId } : {}) };
+    }
+
     // Pi subagent result extraction
     let summary: string;
     if (existsSync(sessionFile)) {
@@ -1330,6 +1769,9 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    if (running.cli === "cursor") {
+      try { await uninstallCursorHookForRun(running.id); } catch {}
+    }
     try {
       closeSurface(surface);
     } catch {}
@@ -1499,6 +1941,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: result.sessionFile,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+                  ...(result.cursorSessionId ? { cursorSessionId: result.cursorSessionId } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },

@@ -297,7 +297,7 @@ You are a specialized agent that does X...
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
-| `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
+| `tools`       | string  | Comma-separated tool allowlist. For Pi-backed agents, use native pi tool names like `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. For Claude Code-backed agents (`cli: claude`), this is passed to Claude Code as `--tools`, so use Claude Code tool names like `Read`, `Grep`, `Glob`, `Bash`, `Edit`. |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
@@ -305,6 +305,13 @@ You are a specialized agent that does X...
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
+| `cli`         | string  | Optional backend CLI. Set `claude` to launch Claude Code instead of Pi for this agent.                                                                                                                                                                                      |
+| `permission-mode` | string | Claude Code only. Passed as `claude --permission-mode <mode>`. If unset for `cli: claude`, the launcher keeps the legacy `--dangerously-skip-permissions` behavior.                                                                                                      |
+| `claude-permission-mode` | string | Claude Code only. Explicit alias for `permission-mode`.                                                                                                                                                                                                          |
+| `allowed-tools` | string | Claude Code only. Alias for `tools`, passed as `claude --tools <tools>`.                                                                                                                                                                                                     |
+| `claude-tools` | string | Claude Code only. Explicit alias for `tools`, passed as `claude --tools <tools>`.                                                                                                                                                                                           |
+| `disallowed-tools` | string | Claude Code only. Passed as `claude --disallowed-tools <tools>`.                                                                                                                                                                                                      |
+| `claude-disallowed-tools` | string | Claude Code only. Explicit alias for `disallowed-tools`.                                                                                                                                                                                                        |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
 ---
@@ -377,6 +384,127 @@ Or per spawn:
 ```typescript
 subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 ```
+
+### Claude Code agents and read-only mode
+
+Agents with `cli: claude` launch Claude Code instead of Pi. This is useful when you want a subagent to use a local Claude Code installation while still being spawned and monitored by this extension.
+
+If a Claude Code agent does not set `permission-mode`, the launcher preserves the bundled `claude-code` behavior and starts Claude Code with `--dangerously-skip-permissions`. To make the default `claude-code` agent safer, override that bundled agent by creating a same-name file in `.pi/agents/claude-code.md` or `~/.pi/agent/agents/claude-code.md` and set Claude Code's permission and tool flags there.
+
+Recommended guidelines:
+
+- Do not edit the bundled `agents/claude-code.md` just to change permissions. Override it with a same-name project-local or global agent file.
+- Use Claude Code tool names, not Pi tool names, for Claude Code agents. Examples: `Read`, `Grep`, `Glob`, `Bash`, `Edit`, `Write`.
+- For read-only investigation, allow only read-oriented Claude Code tools and deny mutation or shell tools.
+- Use `spawning: false` and `deny-tools: claude` when the child should not delegate or call back into Claude Code from Pi tools.
+- Keep `auto-exit: true` for autonomous read-only investigations so the pane closes and reports back when done.
+
+Global override example (`~/.pi/agent/agents/claude-code.md`):
+
+```markdown
+---
+name: claude-code
+description: Read-only Claude Code session for investigation and code exploration
+cli: claude
+model: sonnet
+auto-exit: true
+spawning: false
+deny-tools: claude
+claude-permission-mode: default
+claude-tools: Read,Grep,Glob
+claude-disallowed-tools: Bash,Edit,Write
+---
+
+# Claude Code Read-only
+
+You are a read-only Claude Code session spawned by pi for investigation and code exploration.
+
+You may inspect files with Read, Grep, and Glob. Do not edit files, run shell commands, change repository state, install packages, run tests, or make network calls.
+
+## Guidelines
+
+- Focus on the task given to you.
+- Report concrete findings with evidence, including file paths and relevant excerpts.
+- If you need information that requires shell commands, edits, builds, tests, or network access, explain what is needed instead of attempting it.
+- Your final message should summarize what you found and what you could not verify under read-only constraints.
+```
+
+Then keep using the normal bundled agent name. Agent discovery gives your global or project-local file precedence over the package-bundled definition:
+
+```typescript
+subagent({
+  name: "Read-only investigation",
+  agent: "claude-code",
+  task: "Inspect the auth flow and report where session cookies are created.",
+});
+```
+
+The extension passes the Claude-prefixed fields through to Claude Code as:
+
+```bash
+claude --permission-mode default --tools Read,Grep,Glob --disallowed-tools Bash,Edit,Write
+```
+
+### Cursor Agent agents and read-only mode
+
+Agents with `cli: cursor` launch Cursor Agent instead of Pi. This is useful when you want a subagent to use a local Cursor Agent installation while still being spawned and monitored by this extension.
+
+The bundled `cursor-agent` agent is intentionally autonomous and starts Cursor Agent with `--yolo` via `cursor-yolo: true`. Its bundled model is `composer-2`. To make the default `cursor-agent` safer, override that bundled agent by creating a same-name file in `.pi/agents/cursor-agent.md` or `~/.pi/agent/agents/cursor-agent.md` and set Cursor Agent's mode and permission flags there.
+
+Recommended guidelines:
+
+- Do not edit the bundled `agents/cursor-agent.md` just to change permissions. Override it with a same-name project-local or global agent file.
+- Use Cursor Agent CLI flags through Cursor-prefixed frontmatter. Examples: `cursor-mode: plan`, `cursor-force: false`, `cursor-yolo: true`, `cursor-sandbox: enabled`.
+- For read-only investigation, use `cursor-mode: plan` and `cursor-force: false`.
+- Use `spawning: false` and `deny-tools: cursor` when the child should not delegate or call back into Cursor Agent from Pi tools.
+- Keep `auto-exit: true` for autonomous read-only investigations so the pane closes and reports back when done.
+
+Global override example (`~/.pi/agent/agents/cursor-agent.md`):
+
+```markdown
+---
+name: cursor-agent
+description: Read-only Cursor Agent session for investigation and planning
+cli: cursor
+model: composer-2
+cursor-mode: plan
+cursor-force: false
+auto-exit: true
+spawning: false
+deny-tools: cursor
+---
+
+# Cursor Agent Read-only
+
+You are a read-only Cursor Agent session spawned by pi for investigation and planning.
+
+Do not edit files. Do not run commands that modify files, state, dependencies, git history, services, databases, or external systems.
+
+## Guidelines
+
+- Focus on the task given to you.
+- Inspect the codebase and report concrete findings with evidence, including file paths and relevant excerpts.
+- If you need information that requires edits, builds, tests, shell commands with side effects, or network access, explain what is needed instead of attempting it.
+- Your final message should summarize what you found and what you could not verify under read-only constraints.
+```
+
+Then keep using the normal bundled agent name. Agent discovery gives your global or project-local file precedence over the package-bundled definition:
+
+```typescript
+subagent({
+  name: "Read-only Cursor investigation",
+  agent: "cursor-agent",
+  task: "Inspect the auth flow and report where session cookies are created.",
+});
+```
+
+The extension passes the Cursor-prefixed fields through to Cursor Agent as:
+
+```bash
+agent --mode plan
+```
+
+For Cursor Agent completion detection, the extension temporarily merges a guarded stop hook into `~/.cursor/hooks.json` while a Cursor-backed subagent is running. The hook exits immediately unless `PI_CURSOR_SENTINEL` is set, and the extension removes its hook entry after the last Cursor-backed subagent exits.
 
 ---
 

@@ -12,7 +12,7 @@ const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
-export type SubagentStatusSource = "pi" | "claude";
+export type SubagentStatusSource = "pi" | "claude" | "cursor";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
@@ -202,7 +202,7 @@ export function createStatusState(params: {
   source: SubagentStatusSource;
   startTimeMs: number;
 }): SubagentStatusState {
-  const initialKind = params.source === "claude" ? "running" : "starting";
+  const initialKind = params.source === "pi" ? "starting" : "running";
   return {
     source: params.source,
     startTimeMs: params.startTimeMs,
@@ -218,7 +218,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
-    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotState: "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
     currentKind: initialKind,
@@ -230,7 +230,7 @@ export function observeStatus(
   observation: StatusObservation,
   now: number,
 ): SubagentStatusState {
-  if (state.source === "claude") return state;
+  if (state.source !== "pi") return state;
 
   if (observation.snapshot !== "present") {
     return {
@@ -288,7 +288,7 @@ export function observeStatus(
 }
 
 export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
-  if (state.source === "claude") return state;
+  if (state.source !== "pi") return state;
 
   return {
     ...state,
@@ -340,7 +340,7 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
 
-  if (state.source === "claude") {
+  if (state.source !== "pi") {
     return {
       kind: "running",
       elapsedMs,

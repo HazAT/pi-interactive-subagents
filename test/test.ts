@@ -617,6 +617,14 @@ describe("status.ts", () => {
     assert.equal(snapshot.elapsedText, "2m");
   });
 
+  it("uses elapsed-only fallback for cursor-backed subagents", () => {
+    const state = createStatusState({ source: "cursor", startTimeMs: 0 });
+    const snapshot = classifyStatus(state, 125_000);
+
+    assert.equal(snapshot.kind, "running");
+    assert.equal(snapshot.elapsedText, "2m");
+  });
+
   it("detects stalled transitions and recovery", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
@@ -884,6 +892,53 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads Claude Code permission and tool overrides from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "claude-readonly-test-agent",
+        [
+          "name: claude-readonly-test-agent",
+          "cli: claude",
+          "permission-mode: default",
+          "tools: Read,Grep,Glob",
+          "disallowed-tools: Bash,Edit,Write",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("claude-readonly-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.claudePermissionMode, "default");
+      assert.equal(loaded.claudeAllowedTools, "Read,Grep,Glob");
+      assert.equal(loaded.claudeDisallowedTools, "Bash,Edit,Write");
+    });
+  });
+
+  it("loads Cursor Agent flags from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "cursor-test-agent",
+        [
+          "name: cursor-test-agent",
+          "cli: cursor",
+          "cursor-force: false",
+          "cursor-yolo: true",
+          "cursor-mode: plan",
+          "cursor-sandbox: disabled",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("cursor-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.cli, "cursor");
+      assert.equal(loaded.cursorForce, false);
+      assert.equal(loaded.cursorYolo, true);
+      assert.equal(loaded.cursorMode, "plan");
+      assert.equal(loaded.cursorSandbox, "disabled");
+    });
+  });
+
   it("loads explicit interactive flag from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1089,6 +1144,128 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  });
+
+  it("buildClaudePermissionArgs keeps legacy bypass permissions by default", () => {
+    assert.deepEqual(testApi.buildClaudePermissionArgs(null), ["--dangerously-skip-permissions"]);
+    assert.deepEqual(testApi.buildClaudePermissionArgs({}), ["--dangerously-skip-permissions"]);
+  });
+
+  it("buildClaudePermissionArgs supports read-only Claude Code overrides", () => {
+    assert.deepEqual(
+      testApi.buildClaudePermissionArgs({
+        claudePermissionMode: "default",
+        claudeAllowedTools: "Read,Grep,Glob",
+        claudeDisallowedTools: "Bash,Edit,Write",
+      }),
+      [
+        "--permission-mode",
+        "'default'",
+        "--tools",
+        "'Read,Grep,Glob'",
+        "--disallowed-tools",
+        "'Bash,Edit,Write'",
+      ],
+    );
+  });
+
+  it("buildCursorPermissionArgs defaults to force mode", () => {
+    assert.deepEqual(testApi.buildCursorPermissionArgs(null), ["--force"]);
+    assert.deepEqual(testApi.buildCursorPermissionArgs({}), ["--force"]);
+  });
+
+  it("buildCursorPermissionArgs supports yolo and sandbox overrides", () => {
+    assert.deepEqual(
+      testApi.buildCursorPermissionArgs({
+        cursorForce: false,
+        cursorYolo: true,
+        cursorSandbox: "disabled",
+      }),
+      ["--yolo", "--sandbox", "'disabled'"],
+    );
+  });
+
+  it("buildCursorPermissionArgs supports read-only plan mode", () => {
+    assert.deepEqual(
+      testApi.buildCursorPermissionArgs({
+        cursorMode: "plan",
+        cursorForce: false,
+      }),
+      ["--mode", "'plan'"],
+    );
+  });
+
+  it("merges and removes the Cursor stop hook without touching other hooks", () => {
+    const config = {
+      version: 1,
+      hooks: {
+        stop: [{ command: "./hooks/existing.sh" }],
+        afterFileEdit: [{ command: "./hooks/format.sh" }],
+      },
+    };
+
+    const installed = testApi.ensureCursorHookConfig(config);
+    assert.deepEqual(installed.hooks.stop, [
+      { command: "./hooks/existing.sh" },
+      { command: "./hooks/pi-interactive-subagents-stop.sh", timeout: 10 },
+    ]);
+
+    const removed = testApi.removeCursorHookConfig(installed);
+    assert.deepEqual(removed, config);
+  });
+
+  it("extracts Cursor plan output from transcript before terminal UI text", () => {
+    withTempDir((dir) => {
+      const transcript = join(dir, "cursor.jsonl");
+      writeFileSync(
+        transcript,
+        [
+          JSON.stringify({
+            role: "assistant",
+            message: { content: [{ type: "text", text: "Starting exploration" }] },
+          }),
+          JSON.stringify({
+            role: "assistant",
+            message: {
+              content: [
+                { type: "text", text: "[REDACTED]" },
+                {
+                  type: "tool_use",
+                  name: "CreatePlan",
+                  input: { name: "Repo report", plan: "# Clean report\n\nFindings here." },
+                },
+              ],
+            },
+          }),
+        ].join("\n") + "\n",
+      );
+
+      assert.equal(
+        testApi.extractCursorSummaryFromTranscriptPath(transcript),
+        "# Clean report\n\nFindings here.",
+      );
+    });
+  });
+
+  it("falls back to last Cursor assistant text when no plan exists", () => {
+    withTempDir((dir) => {
+      const transcript = join(dir, "cursor.jsonl");
+      writeFileSync(
+        transcript,
+        [
+          JSON.stringify({
+            role: "assistant",
+            message: { content: [{ type: "text", text: "First message" }] },
+          }),
+          JSON.stringify({
+            role: "assistant",
+            message: { content: [{ type: "text", text: "Final summary" }] },
+          }),
+        ].join("\n") + "\n",
+      );
+
+      assert.equal(testApi.extractCursorSummaryFromTranscriptPath(transcript), "Final summary");
+    });
   });
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
@@ -1840,6 +2017,33 @@ describe("subagent interruption", () => {
         error: "claude interrupt unsupported",
         id: "a1",
         name: "Worker",
+      });
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("delivers Cursor-backed interrupt requests", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const surfaces: string[] = [];
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({
+        cli: "cursor",
+        statusState: createStatusState({ source: "cursor", startTimeMs: 0 }),
+      }));
+
+      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+        surfaces.push(surface);
+      });
+
+      assert.deepEqual(surfaces, ["pane-1"]);
+      assert.deepEqual(result.details, {
+        id: "a1",
+        name: "Worker",
+        status: "interrupt_requested",
       });
     } finally {
       runningMap.clear();
