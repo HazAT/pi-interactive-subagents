@@ -2,11 +2,23 @@ import { execSync, execFile, execFileSync, spawnSync } from "node:child_process"
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
+import {
+  createHerdrSurface,
+  createHerdrSurfaceSplit,
+  readHerdrScreen,
+  readHerdrScreenAsync,
+  sendHerdrCommand,
+  sendHerdrEscape,
+  closeHerdrSurface,
+  renameHerdrTab,
+  renameHerdrWorkspace,
+  isHerdrAvailable,
+} from "./herdr.ts";
 import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,7 +55,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (["cmux", "tmux", "zellij", "wezterm", "herdr"].includes(pref)) return pref as MuxBackend;
   return null;
 }
 
@@ -85,11 +97,13 @@ export function getMuxBackend(): MuxBackend | null {
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "herdr") return isHerdrAvailable() ? "herdr" : null;
 
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isHerdrAvailable()) return "herdr";
   return null;
 }
 
@@ -111,7 +125,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "herdr") {
+    return "Start pi inside herdr (`herdr`, then run `pi`).";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or herdr (`herdr`, then run `pi`).";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -749,10 +766,14 @@ function createCmuxSplitSurface(
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For tmux/wezterm: falls back to split behavior.
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `1-2` in herdr).
  */
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
+
+  if (backend === "herdr") {
+    return createHerdrSurface(name);
+  }
 
   if (backend === "cmux" && cmuxSubagentPane) {
     // Verify the pane still exists before adding a tab to it
@@ -810,7 +831,7 @@ function createSurfaceInPane(name: string, pane: string): string {
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `1-2` in herdr).
  */
 export function createSurfaceSplit(
   name: string,
@@ -818,6 +839,10 @@ export function createSurfaceSplit(
   fromSurface?: string,
 ): string {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    return createHerdrSurfaceSplit(name, direction);
+  }
 
   if (backend === "cmux") {
     return createCmuxSplitSurface(name, direction, fromSurface).surface;
@@ -941,6 +966,11 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    renameHerdrTab(title);
+    return;
+  }
+
   // zellij: rename the agent's own pane, not the whole tab. In multi-pane layouts,
   // rename-tab clobbers the user's tab title whenever a subagent starts or /plan runs.
   // Closes #21.
@@ -996,6 +1026,11 @@ export function renameWorkspace(title: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    renameHerdrWorkspace(title);
+    return;
+  }
+
   // Skip session rename for zellij. rename-session renames the socket file
   // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
   // name, so all subsequent `zellij action ...` CLI calls fail with
@@ -1033,6 +1068,11 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    sendHerdrCommand(surface, command);
+    return;
+  }
+
   zellijActionSync(["write-chars", command], surface);
   zellijActionSync(["write", "13"], surface);
 }
@@ -1057,6 +1097,11 @@ export function sendEscape(surface: string): void {
     execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", "\u001b"], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "herdr") {
+    sendHerdrEscape(surface);
     return;
   }
 
@@ -1132,6 +1177,10 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
+  if (backend === "herdr") {
+    return readHerdrScreen(surface, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
   // and --path may silently fail to create the file. Stdout capture is robust.
@@ -1177,6 +1226,10 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return tailLines(stdout, lines);
   }
 
+  if (backend === "herdr") {
+    return readHerdrScreenAsync(surface, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
   const { stdout } = await execFileAsync(
@@ -1209,6 +1262,11 @@ export function closeSurface(surface: string): void {
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "herdr") {
+    closeHerdrSurface(surface);
     return;
   }
 

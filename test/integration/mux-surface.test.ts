@@ -64,6 +64,12 @@ for (const backend of backends) {
     });
 
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
+      // herdr and wezterm don't expose absolute pane focusing via CLI —
+      // herdr only has directional focus, wezterm has no focus helpers at all.
+      // The --no-focus behavior these backends use for surface creation is
+      // already covered by the other mux-surface tests.
+      if (backend === "herdr" || backend === "wezterm") return;
+
       const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
 

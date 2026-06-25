@@ -89,7 +89,7 @@ export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  for (const backend of ["cmux", "tmux", "zellij", "wezterm", "herdr"] as MuxBackend[]) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -126,6 +126,15 @@ export function focusSurface(backend: MuxBackend, surface: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // Focus the tab containing the pane — herdr has no direct "focus pane X"
+    // CLI, but focusing the tab brings it to the foreground.
+    const info = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
+    const tabId = JSON.parse(info)?.result?.pane?.tab_id;
+    if (tabId) execFileSync("herdr", ["tab", "focus", tabId], { encoding: "utf8" });
+    return;
+  }
+
   throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
@@ -147,6 +156,15 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
     }
   }
 
+  if (backend === "herdr") {
+    try {
+      const info = execFileSync("herdr", ["pane", "current"], { encoding: "utf8" });
+      return JSON.parse(info)?.result?.pane?.pane_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
@@ -157,6 +175,8 @@ export function getSurfacePane(backend: MuxBackend, surface: string): string | n
   }
 
   if (backend === "tmux") return surface;
+
+  if (backend === "herdr") return surface;
 
   throw new Error(`Pane lookup is not implemented for ${backend}`);
 }
