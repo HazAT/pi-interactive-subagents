@@ -387,6 +387,46 @@ describe("session.ts", () => {
       const text = findLastAssistantMessage([ompAssistantMsg] as any[]);
       assert.equal(text, "已完成冒烟测试，子 agent 通信正常。");
     });
+
+    it("falls back to toolResult text when assistant has only toolCall (no text)", () => {
+      // Mirrors the real case: assistant calls subagent_done with no text block,
+      // toolResult contains "Shutting down subagent session."
+      const assistantMsg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "Task complete, calling done." },
+            { type: "toolCall", id: "call_001", name: "subagent_done", arguments: {} },
+          ],
+        },
+      };
+      const toolResultMsg = {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "call_001",
+          toolName: "subagent_done",
+          content: [{ type: "text", text: "Shutting down subagent session." }],
+        },
+      };
+      const text = findLastAssistantMessage([assistantMsg, toolResultMsg] as any[]);
+      assert.equal(text, "Shutting down subagent session.");
+    });
+
+    it("returns null when assistant has toolCall but no matching toolResult", () => {
+      const assistantMsg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "call_001", name: "bash", arguments: {} },
+          ],
+        },
+      };
+      const text = findLastAssistantMessage([assistantMsg] as any[]);
+      assert.equal(text, null);
+    });
   });
 
   describe("appendBranchSummary", () => {

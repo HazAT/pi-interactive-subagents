@@ -107,15 +107,41 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
     const msg = entry as MessageEntry;
     if (msg.message.role !== "assistant") continue;
 
+    // Primary: extract text blocks from assistant content
     const texts = msg.message.content
       .filter(
-        (block) =>
+        (block: any) =>
           block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
       )
-      .map((block) => block.text as string);
+      .map((block: any) => block.text as string);
 
     if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
 
+    // Fallback: when assistant has no text but has tool calls (e.g. subagent_done),
+    // look for the tool result text in subsequent entries.
+    const toolCalls = msg.message.content.filter(
+      (block: any) => block.type === "toolCall" && typeof block.id === "string",
+    );
+    if (toolCalls.length > 0) {
+      const toolCallIds = new Set(toolCalls.map((tc: any) => tc.id));
+      for (let j = i + 1; j < entries.length; j++) {
+        const resultEntry = entries[j];
+        if (resultEntry.type !== "message") continue;
+        const resultMsg = resultEntry as MessageEntry;
+        if (resultMsg.message.role !== "toolResult") continue;
+        const resultToolCallId = (resultMsg.message as any).toolCallId;
+        if (!toolCallIds.has(resultToolCallId)) continue;
+        const resultTexts = resultMsg.message.content
+          .filter(
+            (block: any) =>
+              block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
+          )
+          .map((block: any) => block.text as string);
+        if (resultTexts.length > 0) return resultTexts.join("\n");
+      }
+    }
+
+    // Last resort: error message from stopReason=error
     const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
     const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
     if (
