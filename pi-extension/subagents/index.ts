@@ -512,7 +512,6 @@ interface RunningSubagent {
   };
   abortController?: AbortController;
   cli?: string;
-  /** Non-null when the CLI uses --session-dir (omp); findLatestSessionFile() after exit. */
   sessionDir?: string | null;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -1220,6 +1219,7 @@ async function launchSubagent(
     task: params.task,
     agent: params.agent,
     surface,
+    startTime,
     sessionFile: subagentSessionFile,
     sessionDir: sessionArgs.sessionDir,
     launchScriptFile,
@@ -1334,8 +1334,9 @@ async function watchSubagent(
 
     // Pi/omp subagent result extraction
     let summary: string;
-    // For omp (--session-dir), find the actual session file omp created.
-    // For pi (--session), use the exact file path.
+    // For omp (--session-dir): find the newest .jsonl in the session directory.
+    // -p mode ensures the process exits immediately, so mtime lookup is reliable.
+    // For pi (--session): use the exact file path.
     const effectiveSessionFile = running.sessionDir
       ? findLatestSessionFile(running.sessionDir, sessionFile)
       : sessionFile;

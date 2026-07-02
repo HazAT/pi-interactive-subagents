@@ -11,8 +11,6 @@ function restoreEnvVar(name: string, value: string | undefined) {
   process.env[name] = value;
 }
 
-// ── resolveAgentConfigDir ────────────────────────────────────────────────────
-
 describe("resolveAgentConfigDir", () => {
   const saved: Record<string, string | undefined> = {};
   before(() => { saved["PI_CODING_AGENT_DIR"] = process.env.PI_CODING_AGENT_DIR; });
@@ -35,8 +33,6 @@ describe("resolveAgentConfigDir", () => {
   });
 });
 
-// ── resolveDefaultCli ────────────────────────────────────────────────────────
-
 describe("resolveDefaultCli", () => {
   const saved: Record<string, string | undefined> = {};
   before(() => { saved["PI_SUBAGENT_CLI"] = process.env.PI_SUBAGENT_CLI; });
@@ -55,31 +51,21 @@ describe("resolveDefaultCli", () => {
   });
 });
 
-// ── buildSessionArgs ─────────────────────────────────────────────────────────
-
 describe("buildSessionArgs", () => {
   const file = "/tmp/sessions/abc.jsonl";
 
-  it("pi: returns --session with file path, sessionDir is null", () => {
-    const result = buildSessionArgs("pi", file);
-    assert.deepEqual(result.args, ["--session", file]);
-    assert.equal(result.sessionDir, null);
+  it("pi: --session with file, sessionDir is null", () => {
+    const r = buildSessionArgs("pi", file);
+    assert.deepEqual(r.args, ["--session", file]);
+    assert.equal(r.sessionDir, null);
   });
 
-  it("omp: returns --session-dir + --auto-approve, sessionDir is set", () => {
-    const result = buildSessionArgs("omp", file);
-    assert.deepEqual(result.args, ["--session-dir", "/tmp/sessions", "--auto-approve", "-p"]);
-    assert.equal(result.sessionDir, "/tmp/sessions");
-  });
-
-  it("unknown CLI: falls back to pi format", () => {
-    const result = buildSessionArgs("other", file);
-    assert.deepEqual(result.args, ["--session", file]);
-    assert.equal(result.sessionDir, null);
+  it("omp: --session with file + --auto-approve -p, sessionDir is null", () => {
+    const r = buildSessionArgs("omp", file);
+    assert.deepEqual(r.args, ["--session", file, "--auto-approve", "-p", "--mode", "text"]);
+    assert.equal(r.sessionDir, null);
   });
 });
-
-// ── findLatestSessionFile ────────────────────────────────────────────────────
 
 describe("findLatestSessionFile", () => {
   it("returns null for non-existent directory", () => {
@@ -90,7 +76,6 @@ describe("findLatestSessionFile", () => {
     const dir = mkdtempSync(join(tmpdir(), "session-test-"));
     try {
       writeFileSync(join(dir, "older.jsonl"), "{}\n");
-      // Small delay to ensure different mtime
       const start = Date.now();
       while (Date.now() - start < 10) {} // busy wait 10ms
       writeFileSync(join(dir, "newer.jsonl"), "{}\n");

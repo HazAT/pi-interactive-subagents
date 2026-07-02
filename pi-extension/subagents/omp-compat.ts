@@ -1,16 +1,8 @@
 /**
  * oh-my-pi (omp) compatibility layer.
  *
- * When running inside oh-my-pi (omp), the `pi` binary may not exist and
- * agent definitions live in ~/.omp/agent/agents/ instead of
- * ~/.pi/agent/agents/. This module resolves the correct agent config
- * directory and maps CLI arguments between pi and omp formats.
- *
- * Design goals:
- *   - index.ts calls the exported functions at integration points.
- *   - CLI args are mapped based on which agent config dir is active.
- *   - Zero behavioural change when only ~/.pi/agent exists.
- *   - PI_CODING_AGENT_DIR / PI_SUBAGENT_CLI env vars always take priority.
+ * Resolves the correct agent config directory and maps CLI arguments
+ * between pi and omp formats. Zero behavioural change when running as pi.
  */
 
 import { existsSync, readdirSync, statSync } from "node:fs";
@@ -24,11 +16,7 @@ const piAgentDir = join(homedir(), ".pi", "agent");
 
 /**
  * Resolve the agent config directory.
- *
- * Priority:
- *   1. PI_CODING_AGENT_DIR env var (explicit override)
- *   2. ~/.omp/agent (oh-my-pi environment — checked first)
- *   3. ~/.pi/agent (original default)
+ * Priority: PI_CODING_AGENT_DIR env > ~/.omp/agent > ~/.pi/agent.
  */
 export function resolveAgentConfigDir(): string {
   const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
@@ -40,17 +28,13 @@ export function resolveAgentConfigDir(): string {
 // ── CLI binary name ──────────────────────────────────────────────────────────
 
 /**
- * Derive the default CLI binary name from the active agent config directory.
- *
- * PI_SUBAGENT_CLI env var takes priority when set.
- * Otherwise the parent directory name of the config dir is used
- * (e.g. ~/.omp/agent → "omp", ~/.pi/agent → "pi").
+ * Derive the default CLI binary from the active agent config directory.
+ * PI_SUBAGENT_CLI env var takes priority.
  */
 export function resolveDefaultCli(): string {
   const envCli = process.env.PI_SUBAGENT_CLI?.trim();
   if (envCli) return envCli;
-  const configDir = resolveAgentConfigDir();
-  return basename(dirname(configDir)).replace(/^\./, "");
+  return basename(dirname(resolveAgentConfigDir())).replace(/^\./, "");
 }
 
 // ── CLI argument mapping ─────────────────────────────────────────────────────
@@ -61,45 +45,36 @@ export interface SessionArgs {
   /**
    * When non-null, the CLI uses --session-dir instead of --session.
    * After the process exits, call findLatestSessionFile(sessionDir)
-   * to locate the actual session file omp created.
+   * to locate the actual session file.
    */
   sessionDir: string | null;
 }
 
 /**
- * CLI argument mapping between pi and omp.
+ * Build session-related CLI args.
  *
- * pi uses `--session <file.jsonl>` to specify a session file.
- * omp uses `--session-dir <dir>` + `--auto-approve -p`:
- *   - `--session-dir` lets omp create its own session file in the dir
- *   - `--auto-approve` skips interactive tool approval
- *   - `-p` (print mode) ensures the process exits after the agent responds
- *
- * The `-p` flag is critical: without it, omp stays in interactive mode
- * and the plugin can't detect completion or extract results.
+ * Both pi and omp support `--session <file>` for exact session file path.
+ * omp additionally needs `--auto-approve -p` for non-interactive auto-exit.
  */
 export function buildSessionArgs(cli: string, sessionFile: string): SessionArgs {
   if (cli === "omp") {
-    const dir = dirname(sessionFile);
     return {
-      args: ["--session-dir", dir, "--auto-approve", "-p"],
-      sessionDir: dir,
+      args: ["--session", sessionFile, "--auto-approve", "-p", "--mode", "text"],
+      sessionDir: null,
     };
   }
-  return {
-    args: ["--session", sessionFile],
-    sessionDir: null,
-  };
+  return { args: ["--session", sessionFile], sessionDir: null };
 }
+
+// ── Session file lookup ──────────────────────────────────────────────────────
 
 /**
  * Find the most recently created .jsonl session file in a directory.
- * Used after an omp subagent exits with `-p` mode, since omp creates
- * its own session file with a timestamp-based name.
  *
- * With `-p` mode the process exits immediately after the agent responds,
- * so the newest .jsonl in the directory is guaranteed to be the one from
- * this run (each subagent gets its own session directory).
+ * Used after an omp subagent exits with `-p` mode. Since `-p` ensures
+ * the process exits immediately after the agent responds, and each
+ * subagent gets its own session directory, the newest .jsonl is
+ * guaranteed to be from this run.
  *
  * Returns the full path, or null if no .jsonl files are found.
  * Excludes `excludePath` (the plugin's own placeholder file).
