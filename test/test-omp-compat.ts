@@ -60,10 +60,14 @@ describe("buildSessionArgs", () => {
     assert.equal(r.sessionDir, null);
   });
 
-  it("omp: --session with file + --auto-approve -p, sessionDir is null", () => {
+  it("omp: --session-dir with directory + --auto-approve", () => {
     const r = buildSessionArgs("omp", file);
-    assert.deepEqual(r.args, ["--session", file, "--auto-approve", "-p", "--mode", "text"]);
-    assert.equal(r.sessionDir, null);
+    assert.deepEqual(r.args, ["--session-dir", "/tmp/sessions", "--auto-approve"]);
+    assert.equal(r.sessionDir, "/tmp/sessions");
+    // Must NOT contain legacy flags
+    assert.ok(!r.args.includes("--session"), "should not use --session");
+    assert.ok(!r.args.includes("-p"), "should not use -p");
+    assert.ok(!r.args.includes("--mode"), "should not use --mode");
   });
 });
 

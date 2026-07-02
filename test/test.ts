@@ -364,6 +364,29 @@ describe("session.ts", () => {
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
     });
+
+    it("extracts text from real omp JSONL shape (thinking + text in same content)", () => {
+      // Mirrors the shape from a real omp session file where assistant content
+      // contains both thinking and text blocks in the same message.
+      const ompAssistantMsg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "thinking",
+              thinking: "The user wants a smoke test. Let me respond concisely.",
+            },
+            {
+              type: "text",
+              text: "已完成冒烟测试，子 agent 通信正常。",
+            },
+          ],
+        },
+      };
+      const text = findLastAssistantMessage([ompAssistantMsg] as any[]);
+      assert.equal(text, "已完成冒烟测试，子 agent 通信正常。");
+    });
   });
 
   describe("appendBranchSummary", () => {
@@ -1345,6 +1368,23 @@ describe("cmux.ts interpretExitSidecar", () => {
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  });
+
+  it("includes actualSessionFile when present and non-empty", () => {
+    const result = interpretExitSidecar({
+      type: "done",
+      actualSessionFile: "/tmp/sessions/real-session.jsonl",
+    });
+    assert.equal(result.reason, "done");
+    assert.equal(result.actualSessionFile, "/tmp/sessions/real-session.jsonl");
+  });
+
+  it("omits actualSessionFile when absent or empty string", () => {
+    const noField = interpretExitSidecar({ type: "done" });
+    assert.equal("actualSessionFile" in noField, false);
+
+    const emptyField = interpretExitSidecar({ type: "done", actualSessionFile: "" });
+    assert.equal("actualSessionFile" in emptyField, false);
   });
 });
 describe("commands", () => {

@@ -1224,6 +1224,12 @@ export interface PollResult {
   ping?: { name: string; message: string };
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
+  /**
+   * Actual session file path reported by the subagent via .exit sidecar.
+   * When omp generates its own session filename (different from the plugin's
+   * deterministic path), this field carries the real path for result extraction.
+   */
+  actualSessionFile?: string;
 }
 
 /**
@@ -1231,22 +1237,39 @@ export interface PollResult {
  * the error path in subagent-done.ts). Centralized so both the fast and slow
  * paths in pollForExit decode the payload the same way.
  */
-function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "ping") {
-    return {
+function interpretExitSidecar(data: unknown): PollResult {
+  const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
+  const type = typeof record.type === "string" ? record.type : "";
+  // Only include actualSessionFile when present and non-empty;
+  // omitting it avoids polluting deepEqual assertions with undefined keys.
+  const actualSessionFile = typeof record.actualSessionFile === "string" && record.actualSessionFile.length > 0
+    ? record.actualSessionFile : undefined;
+
+  if (type === "ping") {
+    const result: PollResult = {
       reason: "ping",
       exitCode: 0,
-      ping: { name: data.name, message: data.message },
+      ping: {
+        name: typeof record.name === "string" ? record.name : "subagent",
+        message: typeof record.message === "string" ? record.message : "",
+      },
     };
+    if (actualSessionFile) result.actualSessionFile = actualSessionFile;
+    return result;
   }
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
+  if (type === "error") {
+    const raw = typeof record.errorMessage === "string" ? record.errorMessage.trim() : "";
+    const result: PollResult = {
+      reason: "error",
+      exitCode: 1,
+      errorMessage: raw || "Subagent exited with stopReason=error (no errorMessage in sidecar).",
+    };
+    if (actualSessionFile) result.actualSessionFile = actualSessionFile;
+    return result;
   }
-  return { reason: "done", exitCode: 0 };
+  const result: PollResult = { reason: "done", exitCode: 0 };
+  if (actualSessionFile) result.actualSessionFile = actualSessionFile;
+  return result;
 }
 
 export const __pollForExitTest__ = { interpretExitSidecar };

@@ -1224,6 +1224,7 @@ async function launchSubagent(
     sessionDir: sessionArgs.sessionDir,
     launchScriptFile,
     activityFile,
+    cli: cli === "omp" ? "omp" : "pi",
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1334,27 +1335,31 @@ async function watchSubagent(
 
     // Pi/omp subagent result extraction
     let summary: string;
-    // For omp (--session-dir): find the newest .jsonl in the session directory.
-    // -p mode ensures the process exits immediately, so mtime lookup is reliable.
-    // For pi (--session): use the exact file path.
+    // Session file resolution priority:
+    // 1. findLatestSessionFile in running.sessionDir (parent-specified directory scan)
+    // 2. result.actualSessionFile from .exit sidecar (diagnostic/acceleration)
+    // 3. deterministic sessionFile (pi --session exact path)
     const effectiveSessionFile = running.sessionDir
       ? findLatestSessionFile(running.sessionDir, sessionFile)
-      : sessionFile;
+      : result.actualSessionFile ?? sessionFile;
     if (effectiveSessionFile && existsSync(effectiveSessionFile)) {
       const allEntries = getNewEntries(effectiveSessionFile, 0);
-      summary =
-        findLastAssistantMessage(allEntries) ??
-        (result.errorMessage
+      const assistantText = findLastAssistantMessage(allEntries);
+      if (assistantText) {
+        summary = assistantText;
+      } else {
+        summary = result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
           : result.exitCode !== 0
             ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
+            : `Sub-agent exited without output. No assistant text found in session: ${effectiveSessionFile}`;
+      }
     } else {
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
         : result.exitCode !== 0
           ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+          : `Sub-agent exited without output. Session file not found: ${effectiveSessionFile ?? sessionFile}`;
     }
 
     closeSurface(surface);
@@ -1363,7 +1368,7 @@ async function watchSubagent(
       id: running.id,
       name: running.name,
       agent: running.agent,
-      sessionFile: running.sessionFile,
+      sessionFile: effectiveSessionFile ?? sessionFile,
       status: result.exitCode === 0 ? "done" : "failed",
       exitCode: result.exitCode,
       elapsedMs: elapsed * 1000,

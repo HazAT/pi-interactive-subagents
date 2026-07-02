@@ -79,6 +79,9 @@ export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
+  // Actual session file path from omp's session manager (may differ from
+  // PI_SUBAGENT_SESSION when omp generates its own filename).
+  let actualSessionFile: string | null = null;
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -147,6 +150,17 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    // Capture the actual session file from omp's session manager.
+    // This may differ from PI_SUBAGENT_SESSION when omp generates its own filename.
+    if (ctx && typeof ctx === "object" && "sessionManager" in ctx) {
+      const sm = ctx.sessionManager;
+      if (sm && typeof sm === "object" && "getSessionFile" in sm) {
+        const fn = sm.getSessionFile;
+        if (typeof fn === "function") {
+          actualSessionFile = fn.call(sm) ?? null;
+        }
+      }
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -174,25 +188,27 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
+      // autoExit=true: write sidecar (error or done), then shut down.
+      // For error turns (auto-retry exhausted, provider overload, etc.)
+      // the sidecar carries the failure detail so the parent can report it.
       const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
+          if (errorInfo) {
+            writeFileSync(
+              `${sessionFile}.exit`,
+              JSON.stringify({
+                type: "error",
+                errorMessage: errorInfo.errorMessage,
+                stopReason: errorInfo.stopReason,
+              }),
+            );
+          } else {
+            writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+          }
         } catch {
           // Best effort — even without the sidecar, watcher's session-file
           // fallback can still recover the errorMessage.
@@ -204,10 +220,27 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // autoExit=false (interactive agent): a normal agent_end means the turn
+    // is done and the agent is waiting for user input — NOT completion.
+    // Only write an error sidecar to surface failures; never write
+    // { type: "done" } here — subagent_done or caller_ping handle explicit
+    // completion.
+    const errorInfo = findLatestAssistantError(messages);
+    if (errorInfo && sessionFile) {
+      try {
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({
+            type: "error",
+            errorMessage: errorInfo.errorMessage,
+            stopReason: errorInfo.stopReason,
+          }),
+        );
+      } catch {}
+    }
+
     recorder.agentEndWaiting();
     if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
   });
@@ -312,7 +345,11 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        const payload: Record<string, unknown> = { type: "done" };
+        if (actualSessionFile && actualSessionFile !== sessionFile) {
+          payload.actualSessionFile = actualSessionFile;
+        }
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify(payload));
       }
       ctx.shutdown();
       return {

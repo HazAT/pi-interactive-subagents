@@ -53,14 +53,18 @@ export interface SessionArgs {
 /**
  * Build session-related CLI args.
  *
- * Both pi and omp support `--session <file>` for exact session file path.
- * omp additionally needs `--auto-approve -p` for non-interactive auto-exit.
+ * Pi supports `--session <file>` for exact session file path.
+ * omp uses `--session-dir <dir>` so it creates the session in a known
+ * parent directory; `--auto-approve` skips interactive prompts.
+ * After the process exits, call findLatestSessionFile(sessionDir)
+ * to locate the actual JSONL.
  */
 export function buildSessionArgs(cli: string, sessionFile: string): SessionArgs {
   if (cli === "omp") {
+    const sessionDir = dirname(sessionFile);
     return {
-      args: ["--session", sessionFile, "--auto-approve", "-p", "--mode", "text"],
-      sessionDir: null,
+      args: ["--session-dir", sessionDir, "--auto-approve"],
+      sessionDir,
     };
   }
   return { args: ["--session", sessionFile], sessionDir: null };
@@ -71,9 +75,8 @@ export function buildSessionArgs(cli: string, sessionFile: string): SessionArgs 
 /**
  * Find the most recently created .jsonl session file in a directory.
  *
- * Used after an omp subagent exits with `-p` mode. Since `-p` ensures
- * the process exits immediately after the agent responds, and each
- * subagent gets its own session directory, the newest .jsonl is
+ * Used after an omp subagent exits. Since each subagent gets its own
+ * session directory (via --session-dir), the newest .jsonl is
  * guaranteed to be from this run.
  *
  * Returns the full path, or null if no .jsonl files are found.
