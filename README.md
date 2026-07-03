@@ -177,6 +177,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `pane`                 | boolean | agent frontmatter or `true` | Whether to create a visible multiplexer pane. Set `false` only for omp-backed auto-exit autonomous agents. |
 
 ---
 
@@ -289,6 +290,14 @@ spawning: false
 You are a specialized agent that does X...
 ```
 
+```yaml
+---
+name: scout
+auto-exit: true
+pane: false
+---
+```
+
 ### Frontmatter Reference
 
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
@@ -303,11 +312,14 @@ You are a specialized agent that does X...
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `pane`        | boolean | `true` | Whether to create a visible multiplexer pane. Set `false` only for omp-backed auto-exit autonomous agents (explore, scout, etc). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
 ---
+
+`pane: false` is currently **omp-only** and requires `auto-exit: true`. Interactive, resume, Claude, and pi-backed subagents require a visible pane. Resumed sessions always create a visible pane.
 
 Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
 
@@ -342,7 +354,7 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 **When to use:**
 
-- ✅ Autonomous agents (scout, worker, reviewer) that run to completion
+- ✅ Autonomous agents (scout, worker, reviewer) that run to completion — these can also use `pane: false` to run in the background without a multiplexer pane
 - ❌ Interactive agents (planner, iterate) where the user drives the session
 
 ```yaml
@@ -463,6 +475,106 @@ Every sub-agent session displays a compact tools widget showing available and de
 ```
 
 ---
+
+## Hooks (External Integration)
+
+pi-interactive-subagents can emit hooks to external tools (e.g., [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)) for status monitoring.
+
+### Configuration
+
+Add a `hooks` section to `config.json`:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "status_throttle_ms": 5000,
+    "timeout_ms": 1000,
+    "commands": [
+      {
+        "command": "tmux-agent-sidebar",
+        "args": ["hook", "pi"],
+        "events": ["subagent-start", "subagent-status", "subagent-stop"]
+      }
+    ]
+  }
+}
+```
+
+### Hook Protocol
+
+Hooks use a generic, best-effort protocol:
+
+1. **Invocation**: `<command> <args...> <event>` with JSON payload on stdin
+2. **Fire-and-forget**: Hook failures never affect subagent lifecycle
+3. **Fail-open**: Spawn errors, timeouts, and non-zero exits are silently ignored
+
+Example invocation:
+```bash
+tmux-agent-sidebar hook pi subagent-start
+# stdin: {"version":1,"source":"pi-interactive-subagents","event":"subagent-start","id":"abc","name":"Scout",...}
+```
+
+### Events
+
+| Event | When | Status |
+-------|------|--------|
+| `subagent-start` | Subagent spawned | `starting` |
+| `subagent-status` | Status polled (throttled) | `starting`, `active`, `waiting`, `stalled`, `running` |
+| `subagent-stop` | Subagent completed/failed | `done`, `failed`, `cancelled` |
+
+### Payload Schema
+
+```typescript
+interface HookPayload {
+  version: 1;
+  source: "pi-interactive-subagents";
+  event: "subagent-start" | "subagent-status" | "subagent-stop";
+  id: string;
+  name: string;
+  agent?: string;
+  timestamp: string;  // ISO 8601
+  sequence: number;   // monotonic, for ordering
+  session_file?: string;
+  elapsed_ms?: number;
+
+  // Event-specific fields
+  status: string;
+  tool_name?: string;      // subagent-status only
+  active_scope?: string;   // subagent-status only
+  exit_code?: number;      // subagent-stop only
+  error?: string;          // subagent-stop only
+}
+```
+
+### Multiple Commands (Fan-out)
+
+You can configure multiple hook commands for different consumers:
+
+```json
+{
+  "hooks": {
+    "commands": [
+      { "command": "tmux-agent-sidebar", "args": ["hook", "pi"] },
+      { "command": "/usr/local/bin/audit-log", "args": [], "events": ["subagent-start", "subagent-stop"] }
+    ]
+  }
+}
+```
+
+---
+## oh-my-pi (omp) Compatibility
+
+This plugin works inside [oh-my-pi](https://github.com/can1357/oh-my-pi) environments where the `pi` binary may not be installed.
+
+**Agent config directory** is derived from the running process name. If the binary is `omp`, the plugin uses `~/.omp/agent`; if `pi`, it uses `~/.pi/agent`. This drives both agent discovery and CLI binary selection. Override with:
+
+```bash
+export PI_CODING_AGENT_DIR=~/.omp/agent   # explicit agent config root
+export PI_SUBAGENT_CLI=omp                # explicit CLI binary override
+```
+
+**No changes required** — if `pi` is installed, behaviour is identical to the original.
 
 ## Requirements
 

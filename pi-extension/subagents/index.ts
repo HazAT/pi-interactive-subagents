@@ -4,6 +4,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import {
   readdirSync,
   readFileSync,
@@ -12,8 +13,10 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  createWriteStream,
 } from "node:fs";
 import { homedir } from "node:os";
+import { resolveAgentConfigDir, resolveDefaultCli, buildSessionArgs, findLatestSessionFile } from "./omp-compat.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -53,6 +56,13 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import {
+  type HooksConfig,
+  loadHooksConfig,
+  emitSubagentStart,
+  emitSubagentStatus,
+  emitSubagentStop,
+} from "./hook.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -90,7 +100,7 @@ const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
+        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md and ~/.omp/agent/agents/<name>.md for model, tools, skills.",
     }),
   ),
   systemPrompt: Type.Optional(
@@ -121,6 +131,12 @@ const SubagentParams = Type.Object({
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
     }),
   ),
+  pane: Type.Optional(
+    Type.Boolean({
+      description:
+        "Whether to create a visible multiplexer pane. Defaults to the agent's pane frontmatter, otherwise true. Set false only for autonomous one-shot agents that do not need user interaction or steering.",
+    }),
+  ),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
@@ -140,6 +156,7 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
+  pane?: boolean;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
@@ -195,9 +212,9 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   return denied;
 }
 
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
+/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR and omp detection. */
 function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  return resolveAgentConfigDir();
 }
 
 function getBundledAgentsDir(): string {
@@ -245,6 +262,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
+    pane: parseOptionalBoolean(getFrontmatterValue(frontmatter, "pane")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
@@ -363,7 +381,6 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
     join(configDir, "agents", `${agentName}.md`),
     join(getBundledAgentsDir(), `${agentName}.md`),
   ];
-
   for (const p of paths) {
     if (!existsSync(p)) continue;
     const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
@@ -416,6 +433,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+const hooksConfig = loadHooksConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -504,6 +522,7 @@ interface RunningSubagent {
   };
   abortController?: AbortController;
   cli?: string;
+  sessionDir?: string | null;
   sentinelFile?: string;
   statusState: SubagentStatusState;
   /**
@@ -513,10 +532,41 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Whether the subagent runs in a visible multiplexer pane or as a background process. */
+  paneMode: "visible" | "background";
+  /** PID of the background OMP child process (background mode only). */
+  backgroundPid?: number;
+  /** Full path to the stdout log file (background mode only). */
+  stdoutFile?: string;
+  /** Full path to the stderr log file (background mode only). */
+  stderrFile?: string;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+/** Process handle and log streams for a background (no-pane) subagent. */
+interface BackgroundProcess {
+  child: ReturnType<typeof spawn>;
+  stdoutStream: ReturnType<typeof createWriteStream>;
+  stderrStream: ReturnType<typeof createWriteStream>;
+  /** Cleared when spawn fails; triggers immediate failure in the watch loop. */
+  spawnError?: Error;
+}
+
+/** Background child processes (background mode), keyed by subagent id. */
+const backgroundChildren = new Map<string, BackgroundProcess>();
+
+function cleanupBackgroundProcess(running: RunningSubagent): void {
+  const proc = backgroundChildren.get(running.id);
+  if (proc) {
+    proc.child.removeAllListeners();
+    try { proc.stdoutStream.end(); } catch { /* ignore */ }
+    try { proc.stderrStream.end(); } catch { /* ignore */ }
+    backgroundChildren.delete(running.id);
+  }
+  runningSubagents.delete(running.id);
+}
 
 // ── Widget management ──
 
@@ -606,7 +656,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
-    const left = ` ${elapsed}  ${agent.name}${agentTag} `;
+    const bgTag = agent.paneMode === "background" ? " (bg)" : "";
+    const left = ` ${elapsed}  ${agent.name}${agentTag}${bgTag} `;
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
@@ -813,6 +864,13 @@ function handleSubagentInterrupt(
       details: { error: "claude interrupt unsupported", id: running.id, name: running.name },
     };
   }
+  if (running.paneMode === "background") {
+    return {
+      content: [{ type: "text" as const, text: "Background no-pane subagents cannot be interrupted with Escape; wait for completion." }],
+      details: { error: "background interrupt unsupported", id: running.id, name: running.name },
+    };
+  }
+
 
   const now = Date.now();
   observeRunningSubagent(running, now);
@@ -892,6 +950,14 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function resolveEffectivePane(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): boolean {
+  if (params.pane != null) return params.pane;
+  if (agentDefs?.pane != null) return agentDefs.pane;
+  return true;
+}
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -911,6 +977,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  resolveEffectivePane,
   runningSubagents,
   formatElapsed,
 };
@@ -944,6 +1011,15 @@ async function launchSubagent(
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const effectivePane = resolveEffectivePane(params, agentDefs);
+
+  // pane:false guard checks — must run BEFORE any surface is created
+  if (effectivePane === false && agentDefs?.autoExit !== true) {
+    throw new Error('pane:false requires auto-exit:true; interactive subagents need a visible pane');
+  }
+  if (effectivePane === false && resolveDefaultCli() !== 'omp') {
+    throw new Error('pane:false is currently supported only for omp-backed auto-exit subagents');
+  }
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -966,12 +1042,18 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
+  // Use pre-created surface (parallel mode) or create a new one (visible mode only).
+  // Background mode bypasses surface creation entirely.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+  let surface: string;
+  if (effectivePane === false) {
+    surface = "";
+  } else {
+    const surfacePreCreated = !!options?.surface;
+    surface = options?.surface ?? createSurface(params.name);
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
   }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
@@ -1069,6 +1151,7 @@ async function launchSubagent(
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
+      paneMode: "visible",
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1076,14 +1159,22 @@ async function launchSubagent(
     };
 
     runningSubagents.set(id, running);
+    emitSubagentStart(hooksConfig, {
+      id,
+      name: params.name,
+      agent: params.agent,
+      sessionFile: subagentSessionFile,
+      surface,
+      interactive: effectiveInteractive,
+    });
     return running;
   }
 
   // ── Pi CLI path ──
 
-  // Build pi command
-  const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(subagentSessionFile));
+  const cli = resolveDefaultCli();
+  const sessionArgs = buildSessionArgs(cli, subagentSessionFile);
+  const parts: string[] = [cli, ...sessionArgs.args];
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
@@ -1140,7 +1231,9 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  if (effectivePane !== false) {
+    envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  }
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1186,6 +1279,77 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  // ── Execute: send Long Command (visible) or spawn (background) ──
+  if (effectivePane === false) {
+    // Background no-pane path: write launch script and spawn directly
+    mkdirSync(dirname(launchScriptFile), { recursive: true });
+    const preamble = [
+      "#!/bin/bash",
+      `# Subagent launch script for ${params.name}`,
+      `# Generated: ${new Date().toISOString()}`,
+      `# Session: ${subagentSessionFile}`,
+      `# Mode: background-no-pane`,
+    ].join("\n");
+    writeFileSync(launchScriptFile, `${preamble}\n${command}\n`, { mode: 0o755 });
+
+    // Create log directory and open write streams
+    const logDir = join(artifactDir, "subagent-logs");
+    mkdirSync(logDir, { recursive: true });
+    const stdoutFile = join(logDir, `${id}-stdout.log`);
+    const stderrFile = join(logDir, `${id}-stderr.log`);
+    const stdoutStream = createWriteStream(stdoutFile, { flags: "a" });
+    const stderrStream = createWriteStream(stderrFile, { flags: "a" });
+
+    const child = spawn("bash", [launchScriptFile], {
+      stdio: ["ignore", stdoutStream, stderrStream],
+      detached: false,
+    });
+
+    const proc: BackgroundProcess = { child, stdoutStream, stderrStream, spawnError: undefined };
+    backgroundChildren.set(id, proc);
+
+    // Handle spawn failures — record the error so the watch loop can fail fast
+    child.on("error", (err) => {
+      proc.spawnError = err;
+      try { stdoutStream.end(); } catch { /* ignore */ }
+      try { stderrStream.end(); } catch { /* ignore */ }
+    });
+
+    const running: RunningSubagent = {
+      id,
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      surface: "",
+      startTime,
+      sessionFile: subagentSessionFile,
+      sessionDir: sessionArgs.sessionDir,
+      launchScriptFile,
+      activityFile,
+      cli: cli === "omp" ? "omp" : "pi",
+      interactive: effectiveInteractive,
+      paneMode: "background",
+      backgroundPid: child.pid ?? undefined,
+      stdoutFile,
+      stderrFile,
+      statusState: createStatusState({
+        source: "pi",
+        startTimeMs: startTime,
+      }),
+    };
+
+    runningSubagents.set(id, running);
+    emitSubagentStart(hooksConfig, {
+      id,
+      name: params.name,
+      agent: params.agent,
+      sessionFile: subagentSessionFile,
+      interactive: effectiveInteractive,
+    });
+    return running;
+  }
+
+  // Visible pane path (default)
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
@@ -1204,9 +1368,12 @@ async function launchSubagent(
     surface,
     startTime,
     sessionFile: subagentSessionFile,
+    sessionDir: sessionArgs.sessionDir,
     launchScriptFile,
     activityFile,
+    cli: cli === "omp" ? "omp" : "pi",
     interactive: effectiveInteractive,
+    paneMode: "visible",
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1214,8 +1381,17 @@ async function launchSubagent(
   };
 
   runningSubagents.set(id, running);
+  emitSubagentStart(hooksConfig, {
+    id,
+    name: params.name,
+    agent: params.agent,
+    sessionFile: subagentSessionFile,
+    surface,
+    interactive: effectiveInteractive,
+  });
   return running;
 }
+
 
 /**
  * Watch a launched subagent until it exits. Polls for completion, extracts
@@ -1243,11 +1419,269 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/**
+ * Watch a background (no-pane) OMP subagent via an independent polling loop.
+ * Primary signal: sessionFile + ".exit" sidecar file.
+ * Fallback: child process exit (with one extra poll for late sidecar).
+ */
+async function watchBackgroundSubagent(
+  running: RunningSubagent,
+  signal: AbortSignal,
+): Promise<SubagentResult> {
+  const { name, task, startTime, sessionFile } = running;
+  const proc = backgroundChildren.get(running.id);
+
+  // Fast-fail: spawn already errored before the watcher started
+  if (proc && proc.spawnError) {
+    cleanupBackgroundProcess(running);
+    const spanError = proc.spawnError;
+    emitSubagentStop(hooksConfig, {
+      id: running.id,
+      name: running.name,
+      agent: running.agent,
+      sessionFile,
+      status: "failed",
+      exitCode: 1,
+      elapsedMs: (Date.now() - startTime),
+      error: spanError?.message ?? "spawn failed",
+    });
+    return {
+      name,
+      task,
+      summary: "Background subagent spawn failed: " + (spanError?.message ?? "unknown error"),
+      exitCode: 1,
+      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      error: spanError?.message ?? "spawn failed",
+      sessionFile,
+    };
+  }
+
+  let childExited = false;
+  let childExitCode: number | null = null;
+  let childExitedAt = 0;
+
+  // Track child process exit and error as fallback signals
+  if (proc) {
+    proc.child.on("exit", (code) => {
+      childExited = true;
+      childExitCode = code;
+      childExitedAt = Date.now();
+    });
+    proc.child.on("error", (err) => {
+      proc.spawnError = err;
+      childExited = true;
+      childExitCode = 1;
+      childExitedAt = Date.now();
+    });
+  }
+
+  const combinedSignal = AbortSignal.any([signal, getModuleAbortSignal()]);
+
+  try {
+    // -- Independent polling loop --
+    for (;;) {
+      if (combinedSignal.aborted) {
+        throw new Error("Aborted while waiting for background subagent to finish");
+      }
+
+      // Fast-fail: child error event fired during polling
+      if (proc && proc.spawnError) {
+        throw new Error("Background subagent process error: " + proc.spawnError.message);
+      }
+
+      observeRunningSubagent(running);
+
+      // PRIMARY: check .exit sidecar file (written by subagent_done / caller_ping)
+      const exitFile = sessionFile + ".exit";
+      if (existsSync(exitFile)) {
+        let sidecarData: unknown;
+        try {
+          sidecarData = JSON.parse(readFileSync(exitFile, "utf8"));
+          try { unlinkSync(exitFile); } catch {}
+        } catch {
+          try { unlinkSync(exitFile); } catch {}
+        }
+
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        const result = interpretSidecarForResult(sidecarData, childExited, childExitCode);
+
+        cleanupBackgroundProcess(running);
+
+        emitSubagentStop(hooksConfig, {
+          id: running.id,
+          name: running.name,
+          agent: running.agent,
+          sessionFile: result.effectiveSessionFile ?? sessionFile,
+          status: result.pollResult.exitCode === 0 ? "done" : "failed",
+          exitCode: result.pollResult.exitCode,
+          elapsedMs: elapsed * 1000,
+          error: result.pollResult.errorMessage,
+        });
+
+        return {
+          name,
+          task,
+          summary: result.summary,
+          sessionFile: result.effectiveSessionFile ?? sessionFile,
+          exitCode: result.pollResult.exitCode,
+          elapsed,
+          ping: result.pollResult.ping,
+          ...(result.pollResult.errorMessage ? { errorMessage: result.pollResult.errorMessage } : {}),
+        };
+      }
+
+      // FALLBACK: child process exited but no .exit yet -- wait one extra poll
+      if (childExited && childExitedAt > 0) {
+        const grace = Date.now() - childExitedAt;
+        if (grace >= 1000) {
+          // One poll interval passed with no sidecar -- treat process exit as final
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          const exitCode = childExitCode ?? 1;
+          const summary = exitCode !== 0
+            ? "Background subagent exited with code " + exitCode
+            : "Background subagent exited but no session output was found.";
+
+          cleanupBackgroundProcess(running);
+
+          emitSubagentStop(hooksConfig, {
+            id: running.id,
+            name: running.name,
+            agent: running.agent,
+            sessionFile,
+            status: exitCode === 0 ? "done" : "failed",
+            exitCode,
+            elapsedMs: elapsed * 1000,
+          });
+
+          return {
+            name,
+            task,
+            summary,
+            sessionFile,
+            exitCode,
+            elapsed,
+          };
+        }
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        if (combinedSignal.aborted) return reject(new Error("Aborted"));
+        const timer = setTimeout(() => {
+          combinedSignal.removeEventListener("abort", onAbort);
+          resolve();
+        }, 1000);
+        function onAbort() {
+          clearTimeout(timer);
+          reject(new Error("Aborted"));
+        }
+        combinedSignal.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+  } catch (err: any) {
+    // Use combinedSignal instead of signal so module-abort (session_shutdown)
+    // is correctly classified as "cancelled" rather than "failed".
+    const aborted = combinedSignal.aborted;
+    cleanupBackgroundProcess(running);
+    emitSubagentStop(hooksConfig, {
+      id: running.id,
+      name: running.name,
+      agent: running.agent,
+      sessionFile: running.sessionFile,
+      status: aborted ? "cancelled" : "failed",
+      exitCode: 1,
+      elapsedMs: (Date.now() - startTime),
+      error: aborted ? "cancelled" : (err?.message ?? String(err)),
+    });
+
+    if (aborted) {
+      return {
+        name,
+        task,
+        summary: "Subagent cancelled.",
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: "cancelled",
+        sessionFile,
+      };
+    }
+    return {
+      name,
+      task,
+      summary: "Subagent error: " + (err?.message ?? String(err)),
+      exitCode: 1,
+      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      error: err?.message ?? String(err),
+    };
+  }
+}
+
+/**
+ * Interpret a .exit sidecar payload for a background subagent.
+ * Returns the summary and PollResult-equivalent from session file extraction.
+ */
+function interpretSidecarForResult(
+  sidecarData: unknown,
+  childExited: boolean,
+  childExitCode: number | null,
+) {
+  const record = (sidecarData && typeof sidecarData === "object" ? sidecarData : {}) as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  const actualSessionFile = typeof record.actualSessionFile === "string" && (record.actualSessionFile as string).length > 0
+    ? (record.actualSessionFile as string) : undefined;
+  const errorMessage = typeof record.errorMessage === "string" ? (record.errorMessage as string).trim() : undefined;
+
+  const pollResult: { reason: string; exitCode: number; ping?: { name: string; message: string }; errorMessage?: string; actualSessionFile?: string } = {
+    reason: type === "ping" ? "ping" : type === "error" ? "error" : "done",
+    exitCode: type === "error" ? 1 : 0,
+  };
+
+  if (type === "ping") {
+    pollResult.ping = {
+      name: typeof record.name === "string" ? record.name : "subagent",
+      message: typeof record.message === "string" ? record.message : "",
+    };
+  }
+  if (errorMessage) pollResult.errorMessage = errorMessage;
+  if (actualSessionFile) pollResult.actualSessionFile = actualSessionFile;
+
+  const effectiveSessionFile = actualSessionFile ?? undefined;
+  const sessionFileToCheck = effectiveSessionFile;
+
+  let summary: string;
+  if (sessionFileToCheck && existsSync(sessionFileToCheck)) {
+    const allEntries = getNewEntries(sessionFileToCheck, 0);
+    const assistantText = findLastAssistantMessage(allEntries);
+    if (assistantText) {
+      summary = assistantText;
+    } else {
+      summary = errorMessage
+        ? "Subagent error: " + errorMessage
+        : pollResult.exitCode !== 0
+          ? "Sub-agent exited with code " + pollResult.exitCode
+          : "Sub-agent exited without output. No assistant text found in session: " + sessionFileToCheck;
+    }
+  } else {
+    summary = errorMessage
+      ? "Subagent error: " + errorMessage
+      : pollResult.exitCode !== 0
+        ? "Sub-agent exited with code " + pollResult.exitCode
+        : "Sub-agent exited without output. Session file not found: " + (sessionFileToCheck ?? "(unknown)");
+  }
+
+  return { summary, pollResult, effectiveSessionFile };
+}
+
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+
+  // Background no-pane path: independent polling loop (no cmux surface)
+  if (running.paneMode === "background" && running.cli === "omp") {
+    return watchBackgroundSubagent(running, signal);
+  }
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -1293,37 +1727,66 @@ async function watchSubagent(
 
       closeSurface(surface);
       runningSubagents.delete(running.id);
+      emitSubagentStop(hooksConfig, {
+        id: running.id,
+        name: running.name,
+        agent: running.agent,
+        sessionFile: running.sessionFile,
+        status: result.exitCode === 0 ? "done" : "failed",
+        exitCode: result.exitCode,
+        elapsedMs: elapsed * 1000,
+      });
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
-    // Pi subagent result extraction
+    // Pi/omp subagent result extraction
     let summary: string;
-    if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
-      summary =
-        findLastAssistantMessage(allEntries) ??
-        (result.errorMessage
+    // Session file resolution priority:
+    // 1. findLatestSessionFile in running.sessionDir (parent-specified directory scan)
+    // 2. result.actualSessionFile from .exit sidecar (diagnostic/acceleration)
+    // 3. deterministic sessionFile (pi --session exact path)
+    const effectiveSessionFile = running.sessionDir
+      ? findLatestSessionFile(running.sessionDir, sessionFile)
+      : result.actualSessionFile ?? sessionFile;
+    if (effectiveSessionFile && existsSync(effectiveSessionFile)) {
+      const allEntries = getNewEntries(effectiveSessionFile, 0);
+      const assistantText = findLastAssistantMessage(allEntries);
+      if (assistantText) {
+        summary = assistantText;
+      } else {
+        summary = result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
           : result.exitCode !== 0
             ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
+            : `Sub-agent exited without output. No assistant text found in session: ${effectiveSessionFile}`;
+      }
     } else {
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
         : result.exitCode !== 0
           ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+          : `Sub-agent exited without output. Session file not found: ${effectiveSessionFile ?? sessionFile}`;
     }
 
     closeSurface(surface);
     runningSubagents.delete(running.id);
+    emitSubagentStop(hooksConfig, {
+      id: running.id,
+      name: running.name,
+      agent: running.agent,
+      sessionFile: effectiveSessionFile ?? sessionFile,
+      status: result.exitCode === 0 ? "done" : "failed",
+      exitCode: result.exitCode,
+      elapsedMs: elapsed * 1000,
+      error: result.errorMessage,
+    });
 
     return {
       name,
       task,
       summary,
-      sessionFile,
+      sessionFile: effectiveSessionFile ?? sessionFile,
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
@@ -1334,6 +1797,16 @@ async function watchSubagent(
       closeSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
+    emitSubagentStop(hooksConfig, {
+      id: running.id,
+      name: running.name,
+      agent: running.agent,
+      sessionFile: running.sessionFile,
+      status: signal.aborted ? "cancelled" : "failed",
+      exitCode: 1,
+      elapsedMs: (Date.now() - startTime),
+      error: signal.aborted ? "cancelled" : (err?.message ?? String(err)),
+    });
 
     if (signal.aborted) {
       return {
@@ -1380,6 +1853,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }
+    for (const [_id, agent] of runningSubagents) {
+      if (agent.paneMode === "background") {
+        const proc = backgroundChildren.get(agent.id);
+        if (proc) {
+          try { proc.child.kill(); } catch { /* already dead */ }
+          try { proc.stdoutStream.end(); } catch { /* ignore */ }
+          try { proc.stderrStream.end(); } catch { /* ignore */ }
+        }
+      }
+    }
+    backgroundChildren.clear();
     runningSubagents.clear();
   });
 
@@ -1429,8 +1913,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Validate prerequisites
-        if (!isMuxAvailable()) {
+        // Validate prerequisites (skip mux check for background no-pane subagents)
+        const preResolvedPane = resolveEffectivePane(params, params.agent ? loadAgentDefaults(params.agent) : null);
+        if (preResolvedPane !== false && !isMuxAvailable()) {
           return muxUnavailableResult();
         }
 

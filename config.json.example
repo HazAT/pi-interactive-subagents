@@ -1,5 +1,17 @@
 {
   "status": {
     "enabled": true
+  },
+  "hooks": {
+    "enabled": true,
+    "status_throttle_ms": 5000,
+    "timeout_ms": 1000,
+    "commands": [
+      {
+        "command": "tmux-agent-sidebar",
+        "args": ["hook", "pi"],
+        "events": ["subagent-start", "subagent-status", "subagent-stop"]
+      }
+    ]
   }
 }

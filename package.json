@@ -13,13 +13,18 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
+    "test": "node --test test/test.ts test/test-omp-compat.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": { "optional": true },
+    "@mariozechner/pi-tui": { "optional": true },
+    "@sinclair/typebox": { "optional": true }
   },
   "pi": {
     "extensions": [
