@@ -177,6 +177,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `pane`                 | boolean | agent frontmatter or `true` | Whether to create a visible multiplexer pane. Set `false` only for omp-backed auto-exit autonomous agents. |
 
 ---
 
@@ -289,6 +290,14 @@ spawning: false
 You are a specialized agent that does X...
 ```
 
+```yaml
+---
+name: scout
+auto-exit: true
+pane: false
+---
+```
+
 ### Frontmatter Reference
 
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
@@ -303,11 +312,14 @@ You are a specialized agent that does X...
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `pane`        | boolean | `true` | Whether to create a visible multiplexer pane. Set `false` only for omp-backed auto-exit autonomous agents (explore, scout, etc). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
 ---
+
+`pane: false` is currently **omp-only** and requires `auto-exit: true`. Interactive, resume, Claude, and pi-backed subagents require a visible pane. Resumed sessions always create a visible pane.
 
 Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
 
@@ -342,7 +354,7 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 **When to use:**
 
-- ✅ Autonomous agents (scout, worker, reviewer) that run to completion
+- ✅ Autonomous agents (scout, worker, reviewer) that run to completion — these can also use `pane: false` to run in the background without a multiplexer pane
 - ❌ Interactive agents (planner, iterate) where the user drives the session
 
 ```yaml
