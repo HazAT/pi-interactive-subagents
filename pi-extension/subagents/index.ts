@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { type AutocompleteItem, Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1978,6 +1978,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      // Only complete the agent-name argument; once the user has typed a space
+      // they are entering the freeform task portion — return null there.
+      if (prefix.includes(" ")) return null;
+      const agents = discoverAgentDefinitions();
+      const lower = prefix.toLowerCase();
+      const matches = agents
+        .filter((a) => a.name.toLowerCase().startsWith(lower))
+        .map((a) => ({
+          value: a.name,
+          label: a.description ? `${a.name} — ${a.description}` : a.name,
+        }));
+      return matches.length > 0 ? matches : null;
+    },
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
