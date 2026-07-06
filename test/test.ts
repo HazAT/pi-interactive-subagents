@@ -1,6 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -21,6 +22,12 @@ import {
   shellEscape,
   isCmuxAvailable,
   isWezTermAvailable,
+  buildLaunchScript,
+  launchMarkerPath,
+  runLaunchVerifyLoop,
+  isIdleShellCommand,
+  DEFAULT_LAUNCH_VERIFY_SCHEDULE_MS,
+  type LaunchVerifyResult,
   parseCmuxFocusedSnapshot,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxJson,
@@ -2193,5 +2200,308 @@ describe("cmux.ts", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
     });
+  });
+});
+
+describe("launch verification (cmux.ts)", () => {
+  describe("buildLaunchScript", () => {
+    it("places the idempotency guard before the command", () => {
+      const scriptPath = "/tmp/launch scripts/it's-a-launch.sh";
+      const marker = launchMarkerPath(scriptPath);
+      const content = buildLaunchScript("echo hello", {
+        scriptPath,
+        scriptPreamble: "# preamble line",
+      });
+
+      const lines = content.split("\n");
+      assert.equal(lines[0], "#!/bin/bash");
+      assert.ok(content.includes("# preamble line"));
+
+      const guardCheckIdx = lines.findIndex((l) => l.includes("] && exit 0"));
+      const markerCreateIdx = lines.findIndex((l) => l.startsWith(": > "));
+      const commandIdx = lines.findIndex((l) => l === "echo hello");
+      assert.ok(guardCheckIdx > 0, "guard check line present");
+      assert.ok(markerCreateIdx > guardCheckIdx, "marker created after the guard check");
+      assert.ok(commandIdx > markerCreateIdx, "command runs after marker creation");
+
+      // Marker path is shell-escaped (path contains a space and a quote).
+      assert.ok(lines[guardCheckIdx].includes(shellEscape(marker)));
+      assert.ok(lines[markerCreateIdx].includes(shellEscape(marker)));
+    });
+
+    it("derives the marker path from the script path", () => {
+      assert.equal(launchMarkerPath("/a/b/launch.sh"), "/a/b/launch.sh.started");
+    });
+  });
+
+  describe("guarded script execution", () => {
+    it("is a no-op when executed twice", () => {
+      withTempDir((dir) => {
+        const scriptPath = join(dir, "launch.sh");
+        const logPath = join(dir, "log.txt");
+        const content = buildLaunchScript(`echo ran >> ${shellEscape(logPath)}`, { scriptPath });
+        writeFileSync(scriptPath, content, { mode: 0o755 });
+
+        execFileSync("bash", [scriptPath]);
+        execFileSync("bash", [scriptPath]);
+        execFileSync("bash", [scriptPath]);
+
+        assert.ok(existsSync(launchMarkerPath(scriptPath)), "marker file created");
+        assert.equal(readFileSync(logPath, "utf8"), "ran\n", "command ran exactly once");
+      });
+    });
+  });
+
+  describe("runLaunchVerifyLoop", () => {
+    const instantSleep = async (_ms: number, signal?: AbortSignal) => !signal?.aborted;
+
+    it("does not resend when the marker is already present", async () => {
+      let resends = 0;
+      const result = await runLaunchVerifyLoop(
+        {
+          markerExists: () => true,
+          resend: () => {
+            resends += 1;
+          },
+          sleep: instantSleep,
+        },
+        { scheduleMs: [1, 1, 1] },
+      );
+
+      assert.equal(result.status, "verified");
+      assert.equal(result.resends, 0);
+      assert.equal(resends, 0);
+    });
+
+    it("resends while the marker is absent, then verifies", async () => {
+      let resends = 0;
+      let markerPresent = false;
+      const result = await runLaunchVerifyLoop(
+        {
+          markerExists: () => markerPresent,
+          resend: () => {
+            resends += 1;
+            // The resent launch line "executes" before the next check.
+            markerPresent = true;
+          },
+          sleep: instantSleep,
+        },
+        { scheduleMs: [1, 1, 1] },
+      );
+
+      assert.equal(result.status, "verified");
+      assert.equal(result.resends, 1);
+      assert.equal(resends, 1);
+    });
+
+    it("bounds retries and fails when the marker never appears", async () => {
+      let resends = 0;
+      const result = await runLaunchVerifyLoop(
+        {
+          markerExists: () => false,
+          resend: () => {
+            resends += 1;
+          },
+          sleep: instantSleep,
+        },
+        { scheduleMs: [1, 1, 1], finalGraceMs: 1 },
+      );
+
+      assert.equal(result.status, "failed");
+      assert.equal(result.reason, "marker-missing");
+      assert.equal(resends, 3, "one resend per schedule slot, no more");
+      assert.equal(result.resends, 3);
+    });
+
+    it("skips resends while shouldResend returns false (pane not an idle shell)", async () => {
+      let resends = 0;
+      const result = await runLaunchVerifyLoop(
+        {
+          markerExists: () => false,
+          resend: () => {
+            resends += 1;
+          },
+          shouldResend: () => false,
+          sleep: instantSleep,
+        },
+        { scheduleMs: [1, 1, 1], finalGraceMs: 1 },
+      );
+
+      assert.equal(result.status, "failed");
+      assert.equal(resends, 0, "never typed into a non-idle pane");
+      assert.equal(result.resends, 0);
+    });
+
+    it("fails with surface-gone when the resend throws", async () => {
+      const result = await runLaunchVerifyLoop(
+        {
+          markerExists: () => false,
+          resend: () => {
+            throw new Error("can't find pane: %99");
+          },
+          sleep: instantSleep,
+        },
+        { scheduleMs: [1, 1, 1] },
+      );
+
+      assert.equal(result.status, "failed");
+      assert.equal(result.reason, "surface-gone");
+      assert.equal(result.resends, 0);
+    });
+
+    it("aborts cleanly via AbortSignal", async () => {
+      const controller = new AbortController();
+      controller.abort();
+      let resends = 0;
+      const result = await runLaunchVerifyLoop(
+        {
+          markerExists: () => false,
+          resend: () => {
+            resends += 1;
+          },
+          sleep: instantSleep,
+        },
+        { scheduleMs: [1, 1, 1], signal: controller.signal },
+      );
+
+      assert.equal(result.status, "aborted");
+      assert.equal(resends, 0);
+    });
+
+    it("uses a bounded default schedule", () => {
+      assert.ok(DEFAULT_LAUNCH_VERIFY_SCHEDULE_MS.length >= 3);
+      assert.ok(DEFAULT_LAUNCH_VERIFY_SCHEDULE_MS.every((ms) => Number.isInteger(ms) && ms > 0));
+    });
+  });
+
+  describe("isIdleShellCommand", () => {
+    it("recognizes idle shells", () => {
+      assert.equal(isIdleShellCommand("zsh"), true);
+      assert.equal(isIdleShellCommand("-zsh"), true);
+      assert.equal(isIdleShellCommand("bash"), true);
+      assert.equal(isIdleShellCommand("/usr/local/bin/fish"), true);
+    });
+
+    it("rejects non-shell foreground commands", () => {
+      assert.equal(isIdleShellCommand("node"), false);
+      assert.equal(isIdleShellCommand("pi"), false);
+      assert.equal(isIdleShellCommand("vim"), false);
+      assert.equal(isIdleShellCommand("claude"), false);
+      assert.equal(isIdleShellCommand(""), false);
+    });
+  });
+});
+
+describe("launch failure handling (index.ts)", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function makeRunning(overrides: Record<string, unknown> = {}) {
+    const startTime = Date.now();
+    return {
+      id: `launch-fail-${Math.random().toString(16).slice(2, 10)}`,
+      name: "Test",
+      task: "task",
+      surface: "%42",
+      startTime,
+      sessionFile: "/tmp/session.jsonl",
+      launchScriptFile: "/tmp/artifacts/launch.sh",
+      interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+      ...overrides,
+    };
+  }
+
+  function withRunningEntry(overrides: Record<string, unknown>, run: (running: any) => void) {
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const running = makeRunning(overrides);
+    runningMap.set(running.id, running);
+    try {
+      run(running);
+    } finally {
+      runningMap.delete(running.id);
+    }
+  }
+
+  it("records launch failure and aborts the watcher on failed verification", () => {
+    let aborted = false;
+    withRunningEntry(
+      { abortController: { abort: () => { aborted = true; }, signal: undefined } },
+      (running) => {
+        const result: LaunchVerifyResult = {
+          status: "failed",
+          resends: 4,
+          elapsedMs: 61000,
+          reason: "marker-missing",
+        };
+        testApi.handleLaunchVerifyResult(running, result);
+
+        assert.deepEqual(running.launchFailure, {
+          resends: 4,
+          elapsedMs: 61000,
+          reason: "marker-missing",
+        });
+        assert.equal(aborted, true, "watcher aborted so the failure is delivered");
+      },
+    );
+  });
+
+  it("marks verified launches without touching the watcher", () => {
+    let aborted = false;
+    withRunningEntry(
+      { abortController: { abort: () => { aborted = true; }, signal: undefined } },
+      (running) => {
+        testApi.handleLaunchVerifyResult(running, {
+          status: "verified",
+          resends: 1,
+          elapsedMs: 2000,
+        });
+
+        assert.equal(running.launchVerified, true);
+        assert.equal(running.launchFailure, undefined);
+        assert.equal(aborted, false);
+      },
+    );
+  });
+
+  it("ignores stale results for entries that are no longer tracked", () => {
+    let aborted = false;
+    const running = makeRunning({
+      abortController: { abort: () => { aborted = true; }, signal: undefined },
+    });
+    // Not added to runningSubagents — e.g. finished, cancelled, or /reload cleanup.
+    testApi.handleLaunchVerifyResult(running, {
+      status: "failed",
+      resends: 4,
+      elapsedMs: 61000,
+      reason: "marker-missing",
+    });
+
+    assert.equal(running.launchFailure, undefined);
+    assert.equal(aborted, false);
+  });
+
+  it("formats a truthful launch-failure summary with remediation hints", () => {
+    const running = makeRunning({
+      launchFailure: { resends: 4, elapsedMs: 61000, reason: "marker-missing" },
+    });
+    const summary = testApi.formatLaunchFailureSummary(running);
+
+    assert.ok(summary.includes("never executed the launch command"));
+    assert.ok(summary.includes("4 resends over 61s"));
+    assert.ok(summary.includes("%42"), "includes the surface id");
+    assert.ok(summary.includes("/tmp/artifacts/launch.sh"), "includes the launch script path");
+    assert.ok(summary.includes("pane was left open"));
+    assert.ok(summary.includes("bash '/tmp/artifacts/launch.sh'"), "manual retry line");
+  });
+
+  it("formats a surface-gone launch failure without pane remediation", () => {
+    const running = makeRunning({
+      launchFailure: { resends: 1, elapsedMs: 4000, reason: "surface-gone" },
+    });
+    const summary = testApi.formatLaunchFailureSummary(running);
+
+    assert.ok(summary.includes("pane disappeared"));
+    assert.ok(summary.includes("%42"));
+    assert.ok(!summary.includes("pane was left open"));
   });
 });
