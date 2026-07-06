@@ -1063,6 +1063,194 @@ export function sendEscape(surface: string): void {
   zellijActionSync(["write", "27"], surface);
 }
 
+// ── Launch verification ──
+//
+// Typing the launch line into a freshly created pane races against the pane
+// shell's own startup (direnv/devenv/zsh init can flush the tty input queue,
+// silently discarding the typed command). A fixed post-split delay can never
+// be reliable, so launches are verified and retried instead:
+//
+//   1. The launch script begins with an idempotency guard: it creates a
+//      `<script>.started` marker before running the real command, and exits
+//      immediately if the marker already exists. Resending `bash '<script>'`
+//      is therefore always safe — duplicate executions are no-ops.
+//   2. After the initial send, an async verify loop polls for the marker on a
+//      backoff schedule and resends the launch line while it is absent.
+//
+// See https://github.com/HazAT/pi-interactive-subagents — subagent spawn race.
+
+/** Backoff schedule (ms between marker checks) for the launch verify loop. */
+export const DEFAULT_LAUNCH_VERIFY_SCHEDULE_MS = [2000, 4000, 8000, 15000, 30000];
+
+/** Extra wait after the last resend before declaring the launch failed. */
+const LAUNCH_VERIFY_FINAL_GRACE_MS = 2000;
+
+export interface LaunchVerifyResult {
+  status: "verified" | "failed" | "aborted";
+  /** Number of times the launch line was resent (not counting the initial send). */
+  resends: number;
+  elapsedMs: number;
+  /** Set when status is "failed". */
+  reason?: "marker-missing" | "surface-gone";
+}
+
+export interface LaunchVerifyHooks {
+  /** Whether the `<script>.started` marker exists (launch script began executing). */
+  markerExists: () => boolean;
+  /** Resend the launch line. Should throw if the surface is gone. */
+  resend: () => void;
+  /**
+   * Optional pre-resend check. Return false to skip resending this round
+   * (e.g. the pane is no longer an idle shell, so typing into it would land
+   * in some other program's input). The loop keeps polling either way.
+   */
+  shouldResend?: () => boolean;
+  /** Injectable sleep for tests. Resolves false when aborted. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve(false);
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Path of the idempotency marker created by a guarded launch script. */
+export function launchMarkerPath(scriptPath: string): string {
+  return `${scriptPath}.started`;
+}
+
+/**
+ * Build the guarded launch script content for sendLongCommand.
+ * The guard lines must be the first executable lines so that resending
+ * `bash '<script>'` is always a no-op once the script has started.
+ */
+export function buildLaunchScript(
+  command: string,
+  options: { scriptPath: string; scriptPreamble?: string },
+): string {
+  const marker = shellEscape(launchMarkerPath(options.scriptPath));
+  const scriptParts = ["#!/bin/bash"];
+  if (options?.scriptPreamble) {
+    scriptParts.push(options.scriptPreamble.trimEnd());
+  }
+  scriptParts.push(
+    "# Idempotency guard: resending `bash <script>` is a no-op once started.",
+    `[ -e ${marker} ] && exit 0`,
+    `: > ${marker}`,
+  );
+  scriptParts.push(command);
+  return scriptParts.join("\n") + "\n";
+}
+
+/** Foreground commands that indicate the pane is sitting at an idle shell. */
+const IDLE_SHELL_COMMANDS = new Set([
+  "bash",
+  "zsh",
+  "fish",
+  "sh",
+  "dash",
+  "ksh",
+  "tcsh",
+  "csh",
+  "nu",
+  "pwsh",
+]);
+
+/**
+ * Whether a tmux `#{pane_current_command}` value looks like an idle shell
+ * that is safe to type a launch line into.
+ */
+export function isIdleShellCommand(command: string): boolean {
+  const name = basename(command.trim()).replace(/^-/, "").toLowerCase();
+  return IDLE_SHELL_COMMANDS.has(name);
+}
+
+/**
+ * tmux-only belt-and-suspenders: only resend while the pane's foreground
+ * process is an idle shell. If it is anything else (the subagent's TUI, a
+ * program the user started, shell init children), typing would be misdirected.
+ * If the pane is gone the check returns true so the resend attempt surfaces
+ * the error and ends the loop with "surface-gone".
+ */
+function tmuxPaneIdleShellCheck(surface: string): () => boolean {
+  return () => {
+    try {
+      const current = execFileSync(
+        "tmux",
+        ["display-message", "-p", "-t", surface, "#{pane_current_command}"],
+        { encoding: "utf8" },
+      ).trim();
+      return isIdleShellCommand(current);
+    } catch {
+      return true;
+    }
+  };
+}
+
+/**
+ * Poll for the launch marker on a backoff schedule, resending the launch line
+ * while it is absent. All state is local to this call — safe under N
+ * concurrent launches (each has its own script + marker path).
+ */
+export async function runLaunchVerifyLoop(
+  hooks: LaunchVerifyHooks,
+  options?: { signal?: AbortSignal; scheduleMs?: number[]; finalGraceMs?: number },
+): Promise<LaunchVerifyResult> {
+  const schedule = options?.scheduleMs ?? DEFAULT_LAUNCH_VERIFY_SCHEDULE_MS;
+  const sleep = hooks.sleep ?? abortableSleep;
+  const signal = options?.signal;
+  const start = Date.now();
+  let resends = 0;
+
+  const finish = (
+    status: LaunchVerifyResult["status"],
+    reason?: LaunchVerifyResult["reason"],
+  ): LaunchVerifyResult => ({
+    status,
+    resends,
+    elapsedMs: Date.now() - start,
+    ...(reason ? { reason } : {}),
+  });
+
+  for (const delayMs of schedule) {
+    if (!(await sleep(delayMs, signal)) || signal?.aborted) return finish("aborted");
+    if (hooks.markerExists()) return finish("verified");
+    if (hooks.shouldResend && !hooks.shouldResend()) continue;
+    try {
+      hooks.resend();
+      resends += 1;
+    } catch {
+      return finish("failed", "surface-gone");
+    }
+  }
+
+  // Give the last resend a moment to execute before declaring failure.
+  if (!(await sleep(options?.finalGraceMs ?? LAUNCH_VERIFY_FINAL_GRACE_MS, signal)) || signal?.aborted) {
+    return finish("aborted");
+  }
+  if (hooks.markerExists()) return finish("verified");
+  return finish("failed", "marker-missing");
+}
+
+export interface SendLongCommandVerifyOptions {
+  /** Abort the verify loop (e.g. on /reload or session shutdown). */
+  signal?: AbortSignal;
+  /** Override the backoff schedule (ms). Mainly for tests. */
+  scheduleMs?: number[];
+  /** Called exactly once with the final verification outcome. */
+  onResult?: (result: LaunchVerifyResult) => void;
+}
+
 /**
  * Send a long command to a pane by writing it to a script file first.
  * This avoids terminal line-wrapping issues that break commands exceeding the
@@ -1072,12 +1260,22 @@ export function sendEscape(surface: string): void {
  * stable path (for example under session artifacts) so the exact invocation is
  * preserved for debugging.
  *
+ * The script carries an idempotency guard (see buildLaunchScript), so the
+ * launch line can be resent safely. When `options.verify` is provided, an
+ * async fire-and-forget verify loop polls for the `<script>.started` marker
+ * and resends the launch line until it appears (or retries are exhausted),
+ * reporting the outcome via `verify.onResult`.
+ *
  * Returns the script path.
  */
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: {
+    scriptPath?: string;
+    scriptPreamble?: string;
+    verify?: SendLongCommandVerifyOptions;
+  },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -1088,16 +1286,33 @@ export function sendLongCommand(
     );
   mkdirSync(dirname(scriptPath), { recursive: true });
 
-  const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
-  }
-  scriptParts.push(command);
+  writeFileSync(
+    scriptPath,
+    buildLaunchScript(command, { scriptPath, scriptPreamble: options?.scriptPreamble }),
+    { mode: 0o755 },
+  );
 
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  const launchLine = `bash ${shellEscape(scriptPath)}`;
+  sendCommand(surface, launchLine);
+
+  const verify = options?.verify;
+  if (verify) {
+    const backend = getMuxBackend();
+    const markerPath = launchMarkerPath(scriptPath);
+    void runLaunchVerifyLoop(
+      {
+        markerExists: () => existsSync(markerPath),
+        resend: () => sendCommand(surface, launchLine),
+        shouldResend: backend === "tmux" ? tmuxPaneIdleShellCheck(surface) : undefined,
+      },
+      { signal: verify.signal, scheduleMs: verify.scheduleMs },
+    )
+      .then((result) => verify.onResult?.(result))
+      .catch(() => {
+        // The verify loop never rejects by design; guard against onResult throwing.
+      });
+  }
+
   return scriptPath;
 }
 
