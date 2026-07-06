@@ -27,6 +27,7 @@ import {
   renameCurrentTab,
   renameWorkspace,
   readScreen,
+  type LaunchVerifyResult,
 } from "./cmux.ts";
 
 import {
@@ -486,6 +487,18 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** Set when the launch verify loop confirmed the launch script started. */
+  launchVerified?: boolean;
+  /**
+   * Set when the launch verify loop exhausted its retries: the launch script
+   * never started (or the pane vanished). The watcher turns this into a
+   * truthful launch-failure result instead of "cancelled"/eternal "stalled".
+   */
+  launchFailure?: {
+    resends: number;
+    elapsedMs: number;
+    reason: "marker-missing" | "surface-gone";
+  };
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -498,6 +511,66 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+/**
+ * Handle the outcome of the launch verify loop (see cmux.ts).
+ *
+ * On failure, records the launch failure on the running entry and aborts its
+ * watcher; watchSubagent() then delivers a truthful launch-failure result via
+ * the existing subagent result path (steer message), removes the entry (so
+ * stall pings stop) and keeps the pane open for post-mortem.
+ */
+function handleLaunchVerifyResult(running: RunningSubagent, result: LaunchVerifyResult): void {
+  // The subagent may have finished or been cancelled already, or a stale loop
+  // may report after /reload cleanup — only act on live entries.
+  if (!runningSubagents.has(running.id)) return;
+
+  if (result.status === "verified") {
+    running.launchVerified = true;
+    return;
+  }
+  if (result.status !== "failed") return;
+
+  running.launchFailure = {
+    resends: result.resends,
+    elapsedMs: result.elapsedMs,
+    reason: result.reason ?? "marker-missing",
+  };
+  running.abortController?.abort();
+}
+
+/** Human-readable summary for a launch failure, with remediation hints. */
+function formatLaunchFailureSummary(running: RunningSubagent): string {
+  const failure = running.launchFailure;
+  if (!failure) return "Failed to launch.";
+
+  const seconds = Math.max(1, Math.round(failure.elapsedMs / 1000));
+  const backend = getMuxBackend() ?? "mux";
+  const description =
+    failure.reason === "surface-gone"
+      ? "its terminal pane disappeared before the launch could be verified"
+      : `the shell in its pane never executed the launch command ` +
+        `(${failure.resends} resend${failure.resends === 1 ? "" : "s"} over ${seconds}s)`;
+
+  const lines = [
+    `Failed to launch: ${description}.`,
+    ``,
+    `Surface: ${running.surface} (${backend})`,
+    ...(running.launchScriptFile ? [`Launch script: ${running.launchScriptFile}`] : []),
+  ];
+
+  if (failure.reason !== "surface-gone") {
+    lines.push(``, `The pane was left open for post-mortem.`);
+    if (running.launchScriptFile) {
+      lines.push(
+        `To retry manually, run in that pane (or any shell):`,
+        `  bash ${shellEscape(running.launchScriptFile)}`,
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
 
 // ── Widget management ──
 
@@ -1028,15 +1101,6 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
     const running: RunningSubagent = {
       id,
       name: params.name,
@@ -1056,6 +1120,20 @@ async function launchSubagent(
     };
 
     runningSubagents.set(id, running);
+
+    sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Claude Code subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+      verify: {
+        signal: getModuleAbortSignal(),
+        onResult: (result) => handleLaunchVerifyResult(running, result),
+      },
+    });
+
     return running;
   }
 
@@ -1166,16 +1244,6 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
-
   const running: RunningSubagent = {
     id,
     name: params.name,
@@ -1194,6 +1262,21 @@ async function launchSubagent(
   };
 
   runningSubagents.set(id, running);
+
+  sendLongCommand(surface, command, {
+    scriptPath: launchScriptFile,
+    scriptPreamble: [
+      `# Subagent launch script for ${params.name}`,
+      `# Generated: ${new Date().toISOString()}`,
+      `# Session: ${subagentSessionFile}`,
+      `# Surface: ${surface}`,
+    ].join("\n"),
+    verify: {
+      signal: getModuleAbortSignal(),
+      onResult: (result) => handleLaunchVerifyResult(running, result),
+    },
+  });
+
   return running;
 }
 
@@ -1306,6 +1389,22 @@ async function watchSubagent(
       ping: result.ping,
     };
   } catch (err: any) {
+    if (running.launchFailure) {
+      // The launch never happened: report it truthfully via the normal result
+      // path, stop tracking (no widget entry, no more stall pings), and keep
+      // the pane open for post-mortem — do NOT close the surface.
+      runningSubagents.delete(running.id);
+      return {
+        name,
+        task,
+        summary: formatLaunchFailureSummary(running),
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: "launch-failed",
+        ...(running.cli === "claude" ? {} : { sessionFile }),
+      };
+    }
+
     try {
       closeSurface(surface);
     } catch {}
@@ -1826,17 +1925,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
-
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
@@ -1854,6 +1942,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+
+        sendLongCommand(surface, command, {
+          scriptPath: launchScriptFile,
+          scriptPreamble: [
+            `# Subagent resume script for ${name}`,
+            `# Generated: ${new Date().toISOString()}`,
+            `# Session: ${params.sessionPath}`,
+            `# Surface: ${surface}`,
+            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+          ].join("\n"),
+          verify: {
+            signal: getModuleAbortSignal(),
+            onResult: (result) => handleLaunchVerifyResult(running, result),
+          },
+        });
+
         startWidgetRefresh();
         startStatusRefresh(pi);
 
@@ -1884,10 +1988,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.exitCode !== 0
-                ? `Resumed session exited with code ${result.exitCode}`
-                : "Resumed session exited without new output");
+            // Launch failures carry a truthful summary already — don't replace
+            // it with "exited without new output" from the untouched session.
+            const summary = result.error === "launch-failed"
+              ? result.summary
+              : findLastAssistantMessage(allEntries) ??
+                (result.exitCode !== 0
+                  ? `Resumed session exited with code ${result.exitCode}`
+                  : "Resumed session exited without new output");
             const presentation = resolveResultPresentation(
               { ...result, summary, sessionFile: params.sessionPath },
               name,
