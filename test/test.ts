@@ -53,6 +53,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  createSubagentDoneExtension,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
@@ -2189,6 +2190,76 @@ describe("cmux.ts", () => {
         parseCmuxPaneRefForSurface({ surface_ref: "surface:8", pane_ref: "pane:4" }, "surface:7"),
         null,
       );
+    });
+  });
+
+  describe("subagent widget keybinding", () => {
+    function pressWidgetShortcut(config?: { toggleToolsWidget: string }) {
+      const shortcuts = new Map<string, any>();
+      const extension = createSubagentDoneExtension(config);
+      extension({
+        on() {},
+        getAllTools() { return []; },
+        registerShortcut(key: string, options: any) { shortcuts.set(key, options); },
+        registerTool() {},
+      } as any);
+
+      const key = config?.toggleToolsWidget ?? "ctrl+j";
+      let widgetFactory: any;
+      shortcuts.get(key).handler({
+        ui: { setWidget(_name: string, factory: any) { widgetFactory = factory; } },
+      });
+      const theme = {
+        bg: (_name: string, text: string) => text,
+        bold: (text: string) => text,
+        fg: (_name: string, text: string) => text,
+      };
+      return { output: widgetFactory(null, theme).render(200).join("\n"), shortcuts };
+    }
+
+    it("ctrl+j expands the tool widget when no keybinding option is configured", () => {
+      const { output } = pressWidgetShortcut();
+      assert.match(output, /Ctrl\+J to collapse/);
+    });
+
+    it("a configured keybinding replaces ctrl+j and expands the tool widget", () => {
+      const { output, shortcuts } = pressWidgetShortcut({ toggleToolsWidget: "ctrl+shift+x" });
+
+      assert.equal(shortcuts.has("ctrl+j"), false);
+      assert.match(output, /Ctrl\+Shift\+X to collapse/);
+    });
+
+    it("warns about an invalid shortcut and falls back to ctrl+j", () => {
+      const shortcuts = new Map<string, any>();
+      const handlers = new Map<string, any>();
+      const warnings: string[] = [];
+      createSubagentDoneExtension({ toggleToolsWidget: "cmd+banana" })({
+        on(event: string, handler: any) { handlers.set(event, handler); },
+        getAllTools() { return []; },
+        registerShortcut(key: string, options: any) { shortcuts.set(key, options); },
+        registerTool() {},
+      } as any);
+
+      handlers.get("session_start")({}, {
+        ui: {
+          notify(message: string, level: string) { if (level === "warning") warnings.push(message); },
+          setWidget() {},
+          setStatus() {},
+        },
+      });
+      let widgetFactory: any;
+      shortcuts.get("ctrl+j").handler({
+        ui: { setWidget(_name: string, factory: any) { widgetFactory = factory; } },
+      });
+      const theme = {
+        bg: (_name: string, text: string) => text,
+        bold: (text: string) => text,
+        fg: (_name: string, text: string) => text,
+      };
+      const output = widgetFactory(null, theme).render(200).join("\n");
+
+      assert.match(warnings.join("\n"), /invalid shortcut/i);
+      assert.match(output, /Ctrl\+J to collapse/);
     });
   });
 

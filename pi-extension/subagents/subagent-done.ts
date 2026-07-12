@@ -6,7 +6,9 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -75,7 +77,67 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI) {
+export interface SubagentDoneKeybindings {
+  toggleToolsWidget: unknown;
+}
+
+const DEFAULT_TOGGLE_TOOLS_WIDGET_SHORTCUT = "ctrl+j";
+const SHORTCUT_MODIFIERS = new Set(["ctrl", "shift", "alt"]);
+const SHORTCUT_SPECIAL_KEYS = new Set([
+  "escape", "esc", "enter", "return", "tab", "space", "backspace", "delete", "insert",
+  "clear", "home", "end", "pageUp", "pageDown", "up", "down", "left", "right",
+]);
+const SHORTCUT_SYMBOL_KEYS = new Set("`-=[]\\;',./!@#$%^&*()_+|~{}:<>?".split(""));
+
+function isValidShortcut(shortcut: unknown): shortcut is string {
+  if (typeof shortcut !== "string" || shortcut.length === 0) return false;
+  const modifiers = new Set<string>();
+  let key = shortcut;
+  while (key.includes("+")) {
+    const separator = key.indexOf("+");
+    const modifier = key.slice(0, separator);
+    if (!SHORTCUT_MODIFIERS.has(modifier) || modifiers.has(modifier)) break;
+    modifiers.add(modifier);
+    key = key.slice(separator + 1);
+  }
+  return /^[a-z0-9]$/.test(key) || /^f(?:[1-9]|1[0-2])$/.test(key) ||
+    SHORTCUT_SPECIAL_KEYS.has(key) || SHORTCUT_SYMBOL_KEYS.has(key);
+}
+
+function formatShortcut(shortcut: string): string {
+  return shortcut
+    .split("+")
+    .map((part) => part.length === 1 ? part.toUpperCase() : part[0].toUpperCase() + part.slice(1))
+    .join("+");
+}
+
+export function loadSubagentDoneKeybindings(
+  configPath = join(dirname(fileURLToPath(import.meta.url)), "../..", "config.json"),
+  examplePath = join(dirname(fileURLToPath(import.meta.url)), "../..", "config.json.example"),
+): SubagentDoneKeybindings {
+  let rawConfig: string;
+  try {
+    rawConfig = readFileSync(configPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    rawConfig = readFileSync(examplePath, "utf8");
+  }
+
+  const config = JSON.parse(rawConfig) as { keybindings?: { toggleToolsWidget?: unknown } };
+  return {
+    toggleToolsWidget: config.keybindings?.toggleToolsWidget ?? DEFAULT_TOGGLE_TOOLS_WIDGET_SHORTCUT,
+  };
+}
+
+export function createSubagentDoneExtension(
+  keybindings: SubagentDoneKeybindings = { toggleToolsWidget: DEFAULT_TOGGLE_TOOLS_WIDGET_SHORTCUT },
+) {
+  return function subagentDoneExtension(pi: ExtensionAPI) {
+  const configuredShortcut = keybindings.toggleToolsWidget;
+  const shortcutIsValid = isValidShortcut(configuredShortcut);
+  const toggleToolsWidgetShortcut = shortcutIsValid
+    ? configuredShortcut
+    : DEFAULT_TOGGLE_TOOLS_WIDGET_SHORTCUT;
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -102,7 +164,7 @@ export default function (pi: ExtensionAPI) {
         if (expanded) {
           // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+          const hint = theme.fg("muted", `  (${formatShortcut(toggleToolsWidgetShortcut)} to collapse)`);
 
           const toolList = toolNames
             .map((name: string) => theme.fg("dim", name))
@@ -129,7 +191,7 @@ export default function (pi: ExtensionAPI) {
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
               : "";
-          const hint = theme.fg("muted", "  (Ctrl+J to expand)");
+          const hint = theme.fg("muted", `  (${formatShortcut(toggleToolsWidgetShortcut)} to expand)`);
 
           const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
           box.addChild(content);
@@ -147,6 +209,12 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    if (!shortcutIsValid) {
+      ctx.ui.notify(
+        `Invalid shortcut "${String(configuredShortcut)}" for keybindings.toggleToolsWidget; using Ctrl+J.`,
+        "warning",
+      );
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -256,8 +324,8 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionShutdown((event as any).reason);
   });
 
-  // Toggle expand/collapse with Ctrl+J
-  pi.registerShortcut("ctrl+j", {
+  // Toggle expand/collapse with the configured shortcut.
+  pi.registerShortcut(toggleToolsWidgetShortcut as any, {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;
@@ -321,4 +389,7 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+  };
 }
+
+export default createSubagentDoneExtension(loadSubagentDoneKeybindings());

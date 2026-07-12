@@ -453,7 +453,7 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J` by default:
 
 ```
 [scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
@@ -461,6 +461,21 @@ Every sub-agent session displays a compact tools widget showing available and de
   read, bash, edit, write, todo, ...
   denied: subagent, subagents_list, ...
 ```
+
+Change the shortcut in `config.json` using [Pi's key format](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/keybindings.md):
+
+```json
+{
+  "status": {
+    "enabled": true
+  },
+  "keybindings": {
+    "toggleToolsWidget": "ctrl+shift+x"
+  }
+}
+```
+
+Invalid shortcuts show a warning and fall back to `ctrl+j`.
 
 ---
 

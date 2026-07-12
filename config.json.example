@@ -1,5 +1,8 @@
 {
   "status": {
     "enabled": true
+  },
+  "keybindings": {
+    "toggleToolsWidget": "ctrl+j"
   }
 }
